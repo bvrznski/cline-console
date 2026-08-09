@@ -7,7 +7,8 @@ import { MAX_MESSAGE_BYTES, parseRequest, serializeResponse } from "../ipc/proto
 import { requestOverSocket } from "../ipc/transport";
 import type { IpcResponse } from "../ipc/types";
 import { loadRegistrations, resolveWorkspace } from "../client/ipc_client";
-import { ensureRuntimeDirectory, runtimeDirectory } from "../extension/workspace_registry";
+import { ensureRuntimeDirectory, runtimeDirectory, workspaceId } from "../extension/workspace_registry";
+import { readQueueStatusFile } from "../extension/task_queue";
 import { getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, reconcileLegacyStatus } from "../integrations/cline/completion_monitor";
 import type { ClineStatus } from "../integrations/cline/types";
 
@@ -67,6 +68,11 @@ export class ClineConsoleService {
       this.logger.info(`Routing ${request.action} request ${request.requestId} to ${registration.workspace}.`);
       if (request.action === "activity") {
         const result = await getLegacyWorkspaceActivity(registration.workspace);
+        socket.end(serializeResponse({ protocolVersion: 1, requestId: request.requestId, ok: true, result }));
+        return;
+      }
+      if (request.action === "queueStatus") {
+        const result = await readQueueStatusFile(path.join(this.directory, `queue-${workspaceId(registration.workspace)}.json`), registration.workspace);
         socket.end(serializeResponse({ protocolVersion: 1, requestId: request.requestId, ok: true, result }));
         return;
       }

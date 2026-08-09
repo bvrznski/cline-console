@@ -37,7 +37,7 @@ Requirements: Linux, Node.js 18+, VS Code, and a compatible Cline Legacy extensi
 npm install
 npm run build
 npm run package
-code --install-extension cline-console-0.3.9.vsix
+code --install-extension cline-console-0.4.0.vsix
 npm link
 cline-console service install
 ```
@@ -68,6 +68,8 @@ cline-console status --json
 cline-console --workspace /path/to/repo tasks
 cline-console tasks
 cline-console tasks --json
+cline-console --workspace /path/to/repo queue
+cline-console --workspace /path/to/repo queue --json
 cline-console capabilities
 cline-console workspaces
 cline-console service status
@@ -81,6 +83,10 @@ Workspace              Task       State      Cline  Title
 ```
 
 The `Task` column is the normalized result. `State` retains Cline's underlying task value, and `Title` is the first line of the original task prompt. A completed task remains open for follow-up messages.
+
+`queue` displays the running item and all waiting task/message entries for the
+selected workspace. It includes first-line titles and source paths but never
+prints full prompt bodies. Summary counts show retained completed/failed history.
 
 With multiple windows, select explicitly:
 
@@ -128,6 +134,7 @@ Cline Legacy's exported API does not expose authoritative task status or cancell
 ```bash
 cline-console --workspace /path/from/cline-console-workspaces add -f task_1.md task_2.md
 cline-console --workspace /path/from/cline-console-workspaces add -d task-directory
+cline-console --workspace /path/from/cline-console-workspaces queue
 ```
 
 Directory mode recursively queues all regular files in deterministic relative-path order. Symbolic links are ignored so discovery cannot escape or duplicate the selected tree. An empty directory, empty task file, or mixed `-f`/`-d` invocation is rejected explicitly.

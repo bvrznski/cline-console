@@ -1,6 +1,6 @@
 {
   "name": "cline-console",
-  "version": "0.3.9",
+  "version": "0.4.0",
   "description": "Local terminal control plane for the Cline VS Code extension",
   "publisher": "bvrznski",
   "displayName": "Cline Console",

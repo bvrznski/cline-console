@@ -96,6 +96,11 @@ export class IpcServer {
           result = await this.queue.enqueueMessages(messages);
           break;
         }
+        case "queueStatus": {
+          if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
+          result = this.queue.getStatus();
+          break;
+        }
         case "activity": result = await getLegacyWorkspaceActivity(expected); break;
       }
       this.write(socket, { protocolVersion: 1, requestId: request.requestId, ok: true, result });

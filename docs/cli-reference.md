@@ -56,6 +56,18 @@ Displays workspace, normalized task state, underlying state, Cline version, and
 the first prompt line as the title. Without `--workspace`, all registrations are
 queried.
 
+### `queue`
+
+```bash
+cline-console --workspace /repo queue
+cline-console --workspace /repo queue --json
+```
+
+Displays the selected workspace's currently running queue item and waiting FIFO
+entries. Output includes position, task/message type, state, first-line title,
+and source path without exposing complete prompt bodies. It also summarizes the
+retained completed and failed history counts.
+
 ### Other commands
 
 ```bash

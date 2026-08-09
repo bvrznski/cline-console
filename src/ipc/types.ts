@@ -1,4 +1,25 @@
-export type Action = "newTask" | "sendMessage" | "cancelTask" | "status" | "capabilities" | "enqueueTasks" | "enqueueMessages" | "activity";
+export type Action = "newTask" | "sendMessage" | "cancelTask" | "status" | "capabilities" | "enqueueTasks" | "enqueueMessages" | "queueStatus" | "activity";
+
+export interface QueueStatusItem {
+  position: number;
+  id: string;
+  kind: "task" | "message";
+  state: "queued" | "running";
+  title: string;
+  sourcePath: string;
+  queuedAt: string;
+  dispatchedAt?: string;
+}
+
+export interface QueueStatus {
+  workspace: string;
+  queueLength: number;
+  running: number;
+  queued: number;
+  completed: number;
+  failed: number;
+  items: QueueStatusItem[];
+}
 
 export interface IpcRequest {
   protocolVersion: 1;

@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { Logger } from "../common/logging";
 import type { ClineAdapter } from "../integrations/cline/types";
+import type { QueueStatus } from "../ipc/types";
 import { waitForLegacyMessageCompletion, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle } from "../integrations/cline/completion_monitor";
 
 type QueueState = "queued" | "running" | "completed" | "failed";
@@ -26,6 +27,10 @@ export class TaskQueue {
 
   async enqueueMessages(messages: Array<{ sourcePath: string; message: string; sessionId: string }>): Promise<{ queued: number; queueLength: number }> {
     return this.append(messages.map(message => ({ kind: "message" as const, sourcePath: message.sourcePath, prompt: message.message, targetSessionId: message.sessionId })));
+  }
+
+  getStatus(): QueueStatus {
+    return buildQueueStatus(this.workspace, this.data.items);
   }
 
   private async append(items: Array<{ kind: "task" | "message"; sourcePath: string; prompt: string; targetSessionId?: string }>): Promise<{ queued: number; queueLength: number }> {
@@ -97,4 +102,38 @@ export class TaskQueue {
   }
 
   async stop(): Promise<void> { this.abortController.abort(); await this.worker; }
+}
+
+export async function readQueueStatusFile(file: string, workspace: string): Promise<QueueStatus> {
+  try {
+    const value = JSON.parse(await fs.readFile(file, "utf8")) as QueueFile;
+    if (value.version === 1 && value.workspace === workspace && Array.isArray(value.items)) return buildQueueStatus(workspace, value.items);
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  return buildQueueStatus(workspace, []);
+}
+
+function buildQueueStatus(workspace: string, items: QueueItem[]): QueueStatus {
+  const active = items.filter(item => item.state === "running" || item.state === "queued");
+  return {
+    workspace,
+    queueLength: active.length,
+    running: active.filter(item => item.state === "running").length,
+    queued: active.filter(item => item.state === "queued").length,
+    completed: items.filter(item => item.state === "completed").length,
+    failed: items.filter(item => item.state === "failed").length,
+    items: active.map((item, index) => ({
+      position: index + 1,
+      id: item.id,
+      kind: item.kind ?? "task",
+      state: item.state as "queued" | "running",
+      title: firstLine(item.prompt),
+      sourcePath: item.sourcePath,
+      queuedAt: item.queuedAt,
+      ...(item.dispatchedAt ? { dispatchedAt: item.dispatchedAt } : {})
+    }))
+  };
+}
+
+function firstLine(value: string): string {
+  return value.split(/\r?\n/, 1)[0].trim() || "(untitled)";
 }
