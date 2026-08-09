@@ -1,0 +1,11 @@
+.github/
+.vscode/
+.vscodeignore
+src/
+test/
+task.md
+tsconfig.json
+*.vsix
+*.tgz
+coverage/
+dist/test/

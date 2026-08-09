@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.vsix
+*.tgz
+*.log
+.DS_Store
+.vscode-test/
+.nyc_output/
+coverage/
+
+# Local smoke-test prompts and runtime artifacts
+task.md
+*.tmp

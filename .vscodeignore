@@ -1,0 +1,14 @@
+.git/**
+.gitignore
+.npmignore
+.github/**
+.vscode/**
+node_modules/**
+src/**
+test/**
+task.md
+tsconfig.json
+*.vsix
+*.tgz
+coverage/**
+dist/test/**

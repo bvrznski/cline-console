@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible Cline Console defect
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include prompts, provider credentials, tokens, or private task content.
+  - type: input
+    id: version
+    attributes:
+      label: Cline Console version
+      placeholder: 0.3.9
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, Node.js, VS Code, and Cline versions
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized logs
+    validations:
+      required: true
