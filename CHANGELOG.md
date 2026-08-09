@@ -7,6 +7,11 @@ All notable changes to Cline Console are documented here. The project follows
 
 - Publication documentation and release validation.
 
+## [0.4.1] - 2026-08-10
+
+- Added global `cline-console queue` and `queue --json` views across all
+  registered workspaces while retaining the scoped `--workspace` form.
+
 ## [0.4.0] - 2026-08-10
 
 - Added `queue` and `queue --json` to inspect each workspace's active FIFO
@@ -30,7 +35,8 @@ All notable changes to Cline Console are documented here. The project follows
 
 - Initial terminal-to-VS-Code bridge using Cline's public Legacy extension API.
 
-[Unreleased]: https://github.com/bvrznski/cline-console/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/bvrznski/cline-console/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/bvrznski/cline-console/releases/tag/v0.4.1
 [0.4.0]: https://github.com/bvrznski/cline-console/releases/tag/v0.4.0
 [0.3.9]: https://github.com/bvrznski/cline-console/releases/tag/v0.3.9
 [0.2.0]: https://github.com/bvrznski/cline-console/releases/tag/v0.2.0

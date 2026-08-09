@@ -59,14 +59,18 @@ queried.
 ### `queue`
 
 ```bash
+cline-console queue
+cline-console queue --json
 cline-console --workspace /repo queue
 cline-console --workspace /repo queue --json
 ```
 
-Displays the selected workspace's currently running queue item and waiting FIFO
-entries. Output includes position, task/message type, state, first-line title,
-and source path without exposing complete prompt bodies. It also summarizes the
-retained completed and failed history counts.
+Without `--workspace`, displays currently running and waiting FIFO entries for
+every registered workspace. Add `--workspace` to scope the result. Global JSON
+output is an array; scoped JSON output is one object. Entries include position,
+task/message type, state, first-line title, and source path without exposing
+complete prompt bodies. Each workspace also summarizes retained completed and
+failed history counts.
 
 ### Other commands
 

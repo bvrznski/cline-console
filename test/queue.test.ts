@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { formatQueue } from "../src/client/commands/queue";
+import { formatQueue, formatQueues } from "../src/client/commands/queue";
 import { readQueueStatusFile } from "../src/extension/task_queue";
 
 test("queue formatter displays active items without prompt bodies", () => {
@@ -21,6 +21,15 @@ test("queue formatter displays active items without prompt bodies", () => {
 
 test("queue formatter reports an empty queue", () => {
   assert.match(formatQueue({ workspace: "/repo", queueLength: 0, running: 0, queued: 0, completed: 0, failed: 0, items: [] }), /Queue is empty/);
+});
+
+test("global queue formatter displays every registered workspace", () => {
+  const output = formatQueues([
+    { workspace: "/one", status: { workspace: "/one", queueLength: 0, running: 0, queued: 0, completed: 1, failed: 0, items: [] } },
+    { workspace: "/two", error: "socket closed" }
+  ]);
+  assert.match(output, /Workspace: \/one[\s\S]*Queue is empty/);
+  assert.match(output, /Workspace: \/two[\s\S]*Queue unavailable: socket closed/);
 });
 
 test("persisted queue status exposes titles but not prompt bodies", async () => {

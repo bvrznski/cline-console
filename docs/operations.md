@@ -17,7 +17,7 @@ The extension host keeps the previous code until the window reloads.
 cline-console service status
 cline-console workspaces
 cline-console tasks
-cline-console --workspace /repo queue
+cline-console queue
 cline-console capabilities
 ```
 

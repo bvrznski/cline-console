@@ -13,7 +13,7 @@ import { formatStatus } from "./commands/status";
 import { formatTasks, type WorkspaceTaskStatus } from "./commands/tasks";
 import { readTasks } from "./commands/add";
 import { promptForActiveTaskChoice } from "./commands/active_task_prompt";
-import { formatQueue } from "./commands/queue";
+import { formatQueue, formatQueues, type WorkspaceQueueStatus } from "./commands/queue";
 import type { QueueStatus } from "../ipc/types";
 import { invoke, loadRegistrations, parseWorkspaceSelection, resolveWorkspace } from "./ipc_client";
 import { ClineConsoleService, probeService, serviceSocketPath } from "../service/daemon";
@@ -67,6 +67,16 @@ export async function run(argv = process.argv.slice(2)): Promise<number> {
     process.stdout.write(parsed.json ? `${JSON.stringify(tasks, null, 2)}\n` : `${formatTasks(tasks)}\n`);
     return tasks.some(item => item.error) ? 1 : 0;
   }
+  if (parsed.command === "queue") {
+    const targets = parsed.workspace ? [await resolveWorkspace(registrations, parsed.workspace, process.cwd())] : registrations;
+    const queues: WorkspaceQueueStatus[] = await Promise.all(targets.map(async registration => {
+      try { return { workspace: registration.workspace, status: await invoke(registration, "queueStatus") as QueueStatus }; }
+      catch (error) { return { workspace: registration.workspace, error: errorMessage(error) }; }
+    }));
+    if (parsed.json) process.stdout.write(`${JSON.stringify(parsed.workspace ? queues[0]?.status ?? queues[0] : queues.map(item => item.status ?? { workspace: item.workspace, error: item.error }), null, 2)}\n`);
+    else process.stdout.write(`${parsed.workspace && queues[0]?.status ? formatQueue(queues[0].status) : formatQueues(queues)}\n`);
+    return queues.some(item => item.error) ? 1 : 0;
+  }
   const selected = await selectWorkspace(registrations, parsed.workspace);
   if (parsed.command === "add") {
     const tasks = await readTasks(parsed.commandArgs);
@@ -105,9 +115,6 @@ export async function run(argv = process.argv.slice(2)): Promise<number> {
   } else if (parsed.command === "status") {
     const status = await invoke(selected, "status") as ClineStatus;
     process.stdout.write(parsed.json ? `${JSON.stringify({ workspace: selected.workspace, ...status }, null, 2)}\n` : `${formatStatus(selected.workspace, status)}\n`);
-  } else if (parsed.command === "queue") {
-    const status = await invoke(selected, "queueStatus") as QueueStatus;
-    process.stdout.write(parsed.json ? `${JSON.stringify(status, null, 2)}\n` : `${formatQueue(status)}\n`);
   } else if (parsed.command === "capabilities") {
     const result = await invoke(selected, "capabilities") as { version?: string; capabilities: ClineCapabilities };
     process.stdout.write(parsed.json ? `${JSON.stringify(result, null, 2)}\n` : formatCapabilities(result.version, result.capabilities));

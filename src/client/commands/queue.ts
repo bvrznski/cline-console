@@ -1,5 +1,14 @@
 import type { QueueStatus } from "../../ipc/types";
 
+export interface WorkspaceQueueStatus { workspace: string; status?: QueueStatus; error?: string; }
+
+export function formatQueues(items: WorkspaceQueueStatus[]): string {
+  if (!items.length) return "No registered VS Code workspaces.";
+  return items.map(item => item.error
+    ? `Workspace: ${item.workspace}\nQueue unavailable: ${item.error}`
+    : formatQueue(item.status!)).join("\n\n");
+}
+
 export function formatQueue(status: QueueStatus): string {
   const lines = [
     `Workspace: ${status.workspace}`,

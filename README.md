@@ -37,7 +37,7 @@ Requirements: Linux, Node.js 18+, VS Code, and a compatible Cline Legacy extensi
 npm install
 npm run build
 npm run package
-code --install-extension cline-console-0.4.0.vsix
+code --install-extension cline-console-0.4.1.vsix
 npm link
 cline-console service install
 ```
@@ -68,6 +68,7 @@ cline-console status --json
 cline-console --workspace /path/to/repo tasks
 cline-console tasks
 cline-console tasks --json
+cline-console queue
 cline-console --workspace /path/to/repo queue
 cline-console --workspace /path/to/repo queue --json
 cline-console capabilities
@@ -84,9 +85,10 @@ Workspace              Task       State      Cline  Title
 
 The `Task` column is the normalized result. `State` retains Cline's underlying task value, and `Title` is the first line of the original task prompt. A completed task remains open for follow-up messages.
 
-`queue` displays the running item and all waiting task/message entries for the
-selected workspace. It includes first-line titles and source paths but never
-prints full prompt bodies. Summary counts show retained completed/failed history.
+`queue` displays running and waiting task/message entries across every registered
+workspace. Add `--workspace PATH` to scope the view to one workspace. It includes
+first-line titles and source paths but never prints full prompt bodies. Summary
+counts show retained completed/failed history.
 
 With multiple windows, select explicitly:
 
