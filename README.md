@@ -187,16 +187,33 @@ waiting item and rejects ambiguous titles; it never removes a running item.
 
 A queued task advances only after all of these conditions hold:
 
-1. Cline reports a terminal result for the exact workspace and full prompt.
-2. The result remains continuously terminal for at least 60 seconds.
-3. Any resumed activity resets that 60-second confirmation timer.
-4. After confirmation, a separate 30-second inter-task cooldown completes.
-5. Workspace activity is checked again immediately before dispatch.
+1. The exact task has been observed in Cline's workspace history. Auxiliary
+   session metadata cannot independently authorize completion.
+2. Cline records `completion_result`; `resume_task` remains incomplete and
+   blocks the queue.
+3. The result remains continuously terminal for at least 60 seconds. Any
+   resumed activity resets that confirmation timer.
+4. The completion body contains no explicit non-empty `Remaining`, `Remaining
+   work`, `Remaining tasks`, or `Remaining implementation required` section.
+5. After confirmation, a separate 30-second inter-task cooldown completes.
+6. Workspace activity is checked again immediately before dispatch.
 
 Consequently, at least 90 seconds normally pass between the first terminal
 signal and the next task. Queued follow-up messages do not use the task-to-task
 cooldown. If an observed running queue task is deleted from Cline history, it is
 marked skipped and the next matching FIFO item may advance immediately.
+
+If a completion result explicitly lists remaining work, the worker sends a
+follow-up instructing that same task to finish and validate every remaining
+item. It retains the running queue entry and waits for a later complete result
+that no longer declares unfinished work. Empty declarations such as `None`,
+`N/A`, and `all completed` do not trigger a follow-up.
+
+If Cline records an explicit provider context-window overflow error, the worker
+sends `/compact` to the same task, waits for compaction processing, and then
+asks the task to continue from where it stopped. Each persisted overflow error
+is handled once. Ordinary context-window usage telemetry does not trigger
+automatic compaction.
 
 #### Clearing queues and history
 

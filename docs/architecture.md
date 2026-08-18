@@ -51,9 +51,20 @@ metadata only and deliberately omit task bodies.
 2. The worker waits while the exact workspace has a non-terminal Cline task.
 3. One task or follow-up message is dispatched through Cline's public API.
 4. The worker matches the exact workspace and prompt/session in Cline history.
-5. `completion_result` starts a 60-second confirmation window. It marks
-   completion only if the task remains terminal throughout that window; resumed
-   execution resets the timer. If an observed queued task disappears
+5. Only the exact task's Cline UI history can authorize queue advancement;
+   auxiliary session metadata is never accepted as terminal while that history
+   is available. A `resume_task` marker remains incomplete. `completion_result`
+   starts a 60-second confirmation window and marks completion only if the task
+   remains terminal throughout that window; resumed execution resets the timer.
+   If the completion body contains an explicit non-empty `Remaining` or
+   `Remaining work` section, the worker sends a continuation instruction to the
+   same task and keeps the queue item active until a later complete result has
+   no declared remaining work.
+   An explicit provider context-window overflow error triggers `/compact` on
+   that same task. After compaction finishes, the worker requests continuation
+   and retains the queue item until normal completion. Each persisted error
+   record is handled at most once; ordinary context-usage telemetry is ignored.
+   If an observed queued task disappears
    from Cline's exact-workspace history, it is marked skipped and the next item
    is dispatched without the normal task-to-task cooldown.
 6. Queue state is persisted after every transition.

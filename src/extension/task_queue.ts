@@ -7,9 +7,10 @@ import type { Logger } from "../common/logging";
 import type { ClineAdapter } from "../integrations/cline/types";
 import type { QueueStatus } from "../ipc/types";
 import { waitForLegacyMessageCompletion, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle } from "../integrations/cline/completion_monitor";
+import { hasExplicitRemainingWork } from "../integrations/cline/remaining_work";
 
 type QueueState = "queued" | "running" | "completed" | "failed" | "skipped";
-interface QueueItem { id: string; kind?: "task" | "message"; sourcePath: string; prompt: string; targetSessionId?: string; state: QueueState; queuedAt: string; dispatchedAt?: string; finishedAt?: string; sessionId?: string; error?: string; }
+interface QueueItem { id: string; kind?: "task" | "message"; sourcePath: string; prompt: string; targetSessionId?: string; state: QueueState; queuedAt: string; dispatchedAt?: string; finishedAt?: string; sessionId?: string; lastCompletionMarker?: string; lastRecoveryMarker?: string; error?: string; }
 interface QueueFile { version: 1; workspace: string; paused?: boolean; ignoredWaitingTaskIds?: string[]; items: QueueItem[]; }
 export const TASK_DISPATCH_DELAY_MS = 30_000;
 export const DISPATCH_STABILITY_DELAY_MS = 1_000;
@@ -183,8 +184,33 @@ export class TaskQueue {
       try {
         const result = item.kind === "message"
           ? await waitForLegacyMessageCompletion(this.workspace, item.targetSessionId!, this.abortController.signal, this.logger)
-          : await waitForLegacyTaskCompletion(this.workspace, item.prompt, item.dispatchedAt!, this.abortController.signal, this.logger);
+          : await waitForLegacyTaskCompletion(this.workspace, item.prompt, item.dispatchedAt!, this.abortController.signal, this.logger, undefined, undefined, {
+            knownSessionId: item.sessionId,
+            afterCompletionMarker: item.lastCompletionMarker,
+            afterRecoveryMarker: item.lastRecoveryMarker,
+            onSessionObserved: async sessionId => {
+              item.sessionId = sessionId;
+              await this.persist();
+            }
+          });
         if (result.sessionId) item.sessionId = result.sessionId;
+        if (item.kind !== "message" && result.status === "context_overflow") {
+          item.lastRecoveryMarker = result.recoveryMarker;
+          await this.persist();
+          await this.adapter.sendMessage("/compact");
+          this.logger.info(`Requested context compaction for Cline task ${result.sessionId}.`);
+          await waitForLegacyMessageCompletion(this.workspace, result.sessionId, this.abortController.signal, this.logger);
+          await this.adapter.sendMessage("Continue the current task from where you stopped. Complete all remaining work and validate it before completing the task.");
+          this.logger.info(`Requested continuation after context compaction for Cline task ${result.sessionId}.`);
+          continue;
+        }
+        if (item.kind !== "message" && result.status === "completed" && hasExplicitRemainingWork(result.completionText)) {
+          item.lastCompletionMarker = result.completionMarker;
+          await this.persist();
+          await this.adapter.sendMessage("Complete all remaining work identified in your completion report. Do not stop at a partial implementation; finish and validate every remaining item before completing the task again.");
+          this.logger.info(`Requested completion of explicitly reported remaining work for Cline task ${result.sessionId}.`);
+          continue;
+        }
         item.finishedAt = new Date().toISOString();
         item.state = result.status === "deleted" ? "skipped" : result.status === "completed" && (result.exitCode === undefined || result.exitCode === 0) ? "completed" : "failed";
         if (item.state === "failed") item.error = `Cline session ended with ${result.status}${result.exitCode === undefined ? "" : ` (exit ${result.exitCode})`}.`;

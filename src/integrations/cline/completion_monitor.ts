@@ -4,9 +4,18 @@ import path from "node:path";
 import type { Logger } from "../../common/logging";
 import type { ClineStatus } from "./types";
 import { taskTitle } from "../../common/task_title";
+import { findLatestContextOverflow } from "./context_overflow";
 
-export interface CompletionResult { sessionId: string; status: string; exitCode?: number; }
-export interface TaskCompletionMonitorOptions { deletionGraceMs?: number; pollIntervalMs?: number; terminalStabilityMs?: number; }
+export interface CompletionResult { sessionId: string; status: string; exitCode?: number; completionText?: string; completionMarker?: string; recoveryMarker?: string; }
+export interface TaskCompletionMonitorOptions {
+  deletionGraceMs?: number;
+  pollIntervalMs?: number;
+  terminalStabilityMs?: number;
+  knownSessionId?: string;
+  afterCompletionMarker?: string;
+  afterRecoveryMarker?: string;
+  onSessionObserved?: (sessionId: string) => void | Promise<void>;
+}
 export interface WorkspaceActivity { active: boolean; sessionId?: string; status?: "running" | "waiting" | "idle" | "completed" | "failed"; }
 export interface WorkspaceSessionStatus { sessionId: string; status: string; observedAt: string; title?: string; exitCode?: number; }
 export interface WorkspaceTaskPrompt { sessionId: string; prompt: string; }
@@ -140,14 +149,18 @@ export async function waitForLegacyTaskCompletion(workspace: string, prompt: str
   const deletionDeadline = Date.now() + (options.deletionGraceMs ?? 15_000);
   const pollIntervalMs = options.pollIntervalMs ?? 5_000;
   const terminalStabilityMs = options.terminalStabilityMs ?? 60_000;
-  let observedUiSessionId: string | undefined;
+  let observedUiSessionId = options.knownSessionId;
   let terminalCandidate: { key: string; firstObservedAt: number; result: CompletionResult } | undefined;
   while (!signal.aborted) {
-    const uiLookup = await findMatchingUiTask(vscodeStorage, workspace, prompt, earliest);
+    const uiLookup = await findMatchingUiTask(vscodeStorage, workspace, prompt, earliest, observedUiSessionId, options.afterRecoveryMarker);
     const uiMatch = uiLookup.match;
-    if (uiMatch) observedUiSessionId = uiMatch.sessionId;
+    if (uiMatch && uiMatch.sessionId !== observedUiSessionId) {
+      observedUiSessionId = uiMatch.sessionId;
+      await options.onSessionObserved?.(uiMatch.sessionId);
+    }
+    if (uiMatch?.status === "context_overflow") return uiMatch;
     if (uiMatch) {
-      if (uiMatch.status === "running") terminalCandidate = undefined;
+      if (uiMatch.status === "running" || uiMatch.status === "waiting" || uiMatch.completionMarker === options.afterCompletionMarker) terminalCandidate = undefined;
       else {
         terminalCandidate = updateTerminalCandidate(terminalCandidate, uiMatch, logger);
         if (Date.now() - terminalCandidate.firstObservedAt >= terminalStabilityMs) {
@@ -156,11 +169,15 @@ export async function waitForLegacyTaskCompletion(workspace: string, prompt: str
         }
       }
     }
-    if (uiLookup.historyAvailable && !uiMatch && (observedUiSessionId !== undefined || Date.now() >= deletionDeadline)) {
+    if (uiLookup.historyAvailable && !uiMatch && observedUiSessionId !== undefined && Date.now() >= deletionDeadline) {
       logger.info(`Queued Cline task${observedUiSessionId ? ` ${observedUiSessionId}` : ""} disappeared from workspace history; skipping it.`);
       return { sessionId: observedUiSessionId ?? "", status: "deleted" };
     }
-    const match = uiMatch ? undefined : await findMatchingSession(sessions, workspace, prompt, earliest);
+    // Once Cline's authoritative UI history is available, never use the
+    // auxiliary session mirror to declare completion. It can report idle or
+    // completed before Cline has either persisted the task or accepted its
+    // final completion_result, which would jump over resumable tasks.
+    const match = uiLookup.historyAvailable ? undefined : await findMatchingSession(sessions, workspace, prompt, earliest);
     if (match) {
       if (isTerminalStatus(match.status)) {
         terminalCandidate = updateTerminalCandidate(terminalCandidate, match, logger);
@@ -186,19 +203,33 @@ function updateTerminalCandidate(candidate: { key: string; firstObservedAt: numb
   return { key, firstObservedAt: Date.now(), result };
 }
 
-async function findMatchingUiTask(storage: string, workspace: string, prompt: string, earliest: number): Promise<{ historyAvailable: boolean; match?: CompletionResult }> {
+async function findMatchingUiTask(storage: string, workspace: string, prompt: string, earliest: number, knownSessionId?: string, afterRecoveryMarker?: string): Promise<{ historyAvailable: boolean; match?: CompletionResult }> {
   try {
     const history = JSON.parse(await fs.readFile(path.join(storage, "state", "taskHistory.json"), "utf8")) as Array<Record<string, unknown>>;
-    const entry = [...history].reverse().find(item =>
-      item.cwdOnTaskInitialization === workspace && item.task === prompt && typeof item.id === "string" && Number(item.id) >= earliest
-    );
+    const entry = [...history].reverse().find(item => item.cwdOnTaskInitialization === workspace && typeof item.id === "string" && (
+      knownSessionId ? item.id === knownSessionId : item.task === prompt && Number(item.id) >= earliest
+    ));
     if (!entry) return { historyAvailable: true };
     const sessionId = String(entry.id);
     const messages = JSON.parse(await fs.readFile(path.join(storage, "tasks", sessionId, "ui_messages.json"), "utf8")) as Array<Record<string, unknown>>;
     const last = messages.at(-1);
     if (!last) return { historyAvailable: true };
+    const overflow = findLatestContextOverflow(messages, sessionId);
+    if (overflow && overflow.marker !== afterRecoveryMarker) {
+      return { historyAvailable: true, match: { sessionId, status: "context_overflow", recoveryMarker: overflow.marker } };
+    }
     const completed = last.ask === "completion_result" || last.say === "completion_result";
-    return { historyAvailable: true, match: { sessionId, status: completed ? "completed" : "running" } };
+    const waiting = last.ask === "resume_task";
+    const completion = completed ? [...messages].reverse().find(message =>
+      (message.ask === "completion_result" || message.say === "completion_result") && typeof message.text === "string"
+    ) : undefined;
+    const markerPart = String(last.ts ?? messages.length);
+    return { historyAvailable: true, match: {
+      sessionId,
+      status: completed ? "completed" : waiting ? "waiting" : "running",
+      ...(completed ? { completionMarker: `${sessionId}:${markerPart}` } : {}),
+      ...(typeof completion?.text === "string" ? { completionText: completion.text } : {})
+    } };
   } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { historyAvailable: false }; return { historyAvailable: false }; }
 }
 
