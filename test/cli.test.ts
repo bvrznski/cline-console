@@ -44,6 +44,7 @@ test("canonical task grammar normalizes to existing execution commands", () => {
   assert.equal(normalizeCommand(parseArgs(["task", "start", "--file", "task.md"])).parsed.command, "new");
   assert.deepEqual(normalizeCommand(parseArgs(["task", "send", "--text", "Continue"])).parsed.commandArgs, ["Continue"]);
   assert.deepEqual(normalizeCommand(parseArgs(["task", "restart"])).parsed.commandArgs, ["reload"]);
+  assert.deepEqual(normalizeCommand(parseArgs(["task", "finish"])).parsed.commandArgs, ["finish"]);
   assert.throws(() => normalizeCommand(parseArgs(["task", "start", "--file", "one", "two"])), /exactly one/);
 });
 

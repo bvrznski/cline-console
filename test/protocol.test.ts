@@ -10,6 +10,14 @@ test("IPC request round-trips without normalizing prompt text", () => {
   assert.equal(request.payload?.prompt, prompt);
 });
 
+test("IPC accepts workspace unfinished-task recovery", () => {
+  const request = makeRequest("finishUnfinishedTasks", "/tmp/work");
+  const parsed = parseRequest(JSON.stringify(request));
+  assert.equal(parsed.action, request.action);
+  assert.equal(parsed.workspace, request.workspace);
+  assert.equal(parsed.requestId, request.requestId);
+});
+
 test("IPC rejects unsupported protocol versions", () => {
   assert.throws(() => parseRequest(JSON.stringify({ protocolVersion: 2, requestId: "x", action: "status", workspace: "/tmp" })),
     (error: unknown) => error instanceof ClineConsoleError && error.code === "PROTOCOL_MISMATCH");

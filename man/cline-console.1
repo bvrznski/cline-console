@@ -78,6 +78,13 @@ workspace is recommended and required when selection would be ambiguous.
 Restart the latest exact-workspace task using its original full prompt from
 Cline history.
 .TP
+.B tasks finish
+Queue every exact-workspace Cline history item ending in
+.B resume_task
+for completion, oldest first. Already retained queue-history entries are
+deduplicated. Cline Legacy does not expose native historical resume, so prompts
+are re-run through the normal queue.
+.TP
 .B task capabilities
 Display the detected Cline version and supported adapter operations.
 .SH QUEUE COMMANDS

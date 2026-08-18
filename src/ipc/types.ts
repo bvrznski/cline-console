@@ -1,4 +1,4 @@
-export type Action = "newTask" | "reloadTask" | "skipWaitingTask" | "sendMessage" | "cancelTask" | "status" | "capabilities" | "enqueueTasks" | "enqueueMessages" | "replaceQueue" | "clearQueue" | "clearWorkspace" | "popQueue" | "pauseQueue" | "resumeQueue" | "queueStatus" | "activity";
+export type Action = "newTask" | "reloadTask" | "finishUnfinishedTasks" | "skipWaitingTask" | "sendMessage" | "cancelTask" | "status" | "capabilities" | "enqueueTasks" | "enqueueMessages" | "replaceQueue" | "clearQueue" | "clearWorkspace" | "popQueue" | "pauseQueue" | "resumeQueue" | "queueStatus" | "activity";
 
 export interface QueueStatusItem {
   position: number;

@@ -40,6 +40,7 @@ cline-console -w /repo task status
 cline-console tasks --json
 cline-console -w /repo task stop
 cline-console -w /repo task restart
+cline-console -w /repo tasks finish
 cline-console -w /repo task capabilities
 ```
 
@@ -52,6 +53,12 @@ completed task or queues a follow-up for a running one.
 workspaces unless scoped. `task stop` uses Cline's normal cancellation path.
 `task restart` restarts the latest exact-workspace history item from its original
 full prompt.
+
+`tasks finish` discovers exact-workspace history entries ending in
+`resume_task`, appends their original prompts to the queue oldest-first, and
+deduplicates entries already retained by that queue. Because Cline Legacy does
+not expose the native History resume action, these tasks are re-run through the
+normal queue.
 
 ## Queue commands
 

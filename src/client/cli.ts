@@ -33,7 +33,7 @@ Usage:
   cline-console [OPTIONS] task send (--file FILE|--text TEXT|--stdin)
   cline-console [OPTIONS] task status
   cline-console [OPTIONS] tasks
-  cline-console --workspace PATH tasks stop|reload
+  cline-console --workspace PATH tasks stop|reload|finish
   cline-console --workspace PATH queue add (--file FILE...|--dir DIRECTORY [--newer-than FILE]) [--resume]
   cline-console --workspace PATH queue replace (--file FILE...|--dir DIRECTORY [--newer-than FILE])
   cline-console [OPTIONS] queue list
@@ -71,20 +71,23 @@ export async function run(argv = process.argv.slice(2)): Promise<number> {
   }
   if (parsed.command === "tasks") {
     const operation = parsed.commandArgs[0];
-    if (operation === "stop" || operation === "reload") {
+    if (operation === "stop" || operation === "reload" || operation === "finish") {
       if (!parsed.workspace) throw new Error(`tasks ${operation} requires --workspace PATH.`);
-      if (parsed.commandArgs.length !== 1) throw new Error("tasks stop/reload accepts no additional arguments.");
+      if (parsed.commandArgs.length !== 1) throw new Error("tasks stop/reload/finish accepts no additional arguments.");
       const target = await resolveWorkspace(registrations, parsed.workspace, process.cwd());
       if (operation === "stop") {
         await invoke(target, "cancelTask");
         process.stdout.write(`Workspace: ${target.workspace}\nTask stopped through Cline's normal cancellation path.\n`);
-      } else {
+      } else if (operation === "reload") {
         const result = await invoke(target, "reloadTask") as { taskReloaded: boolean; previousTaskId: string };
         process.stdout.write(`Workspace: ${target.workspace}\nTask reloaded from Cline history.\nPrevious task ID: ${result.previousTaskId}\n`);
+      } else {
+        const result = await invoke(target, "finishUnfinishedTasks") as { discovered: number; queued: number; skippedExisting: number; queueLength: number };
+        process.stdout.write(parsed.json ? `${JSON.stringify({ workspace: target.workspace, ...result }, null, 2)}\n` : `Workspace: ${target.workspace}\nUnfinished tasks discovered: ${result.discovered}\nQueued for completion: ${result.queued}\nAlready represented in queue history: ${result.skippedExisting}\nQueue length: ${result.queueLength}\n`);
       }
       return 0;
     }
-    if (parsed.commandArgs.length) throw new Error("tasks accepts only stop or reload as an operation.");
+    if (parsed.commandArgs.length) throw new Error("tasks accepts only stop, reload, or finish as an operation.");
     const targets = parsed.workspace ? [await resolveWorkspace(registrations, parsed.workspace, process.cwd())] : registrations;
     const tasks: WorkspaceTaskStatus[] = await Promise.all(targets.map(async registration => {
       try { return { workspace: registration.workspace, status: await invoke(registration, "status") as ClineStatus }; }

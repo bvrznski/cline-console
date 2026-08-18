@@ -30,6 +30,13 @@ export class TaskQueue {
     return this.append(tasks.map(task => ({ kind: "task" as const, sourcePath: task.sourcePath, prompt: task.prompt })));
   }
 
+  async enqueueUnfinished(tasks: Array<{ sourcePath: string; prompt: string }>): Promise<{ queued: number; skippedExisting: number; queueLength: number }> {
+    const existingSources = new Set(this.data.items.map(item => item.sourcePath));
+    const fresh = tasks.filter(task => !existingSources.has(task.sourcePath));
+    const result = fresh.length ? await this.enqueue(fresh) : { queued: 0, queueLength: this.data.items.filter(item => item.state === "queued" || item.state === "running").length };
+    return { ...result, skippedExisting: tasks.length - fresh.length };
+  }
+
   async enqueueMessages(messages: Array<{ sourcePath: string; message: string; sessionId: string }>): Promise<{ queued: number; queueLength: number }> {
     return this.append(messages.map(message => ({ kind: "message" as const, sourcePath: message.sourcePath, prompt: message.message, targetSessionId: message.sessionId })));
   }

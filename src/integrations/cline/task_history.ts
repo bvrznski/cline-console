@@ -3,6 +3,24 @@ import os from "node:os";
 import path from "node:path";
 
 export interface DeletedTaskHistory { deleted: number; taskIds: string[]; }
+export interface UnfinishedTaskHistory { sessionId: string; prompt: string; sourcePath: string; }
+
+export async function getLegacyUnfinishedWorkspaceTasks(workspace: string, vscodeStorageOverride?: string): Promise<UnfinishedTaskHistory[]> {
+  const storage = vscodeStorageOverride || process.env.CLINE_VSCODE_STORAGE_DIR?.trim() || path.join(os.homedir(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
+  let history: Array<Record<string, unknown>>;
+  try { history = JSON.parse(await fs.readFile(path.join(storage, "state", "taskHistory.json"), "utf8")) as Array<Record<string, unknown>>; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+  if (!Array.isArray(history)) throw new Error("Cline task history is not an array.");
+  const unfinished: UnfinishedTaskHistory[] = [];
+  for (const entry of history) {
+    if (entry.cwdOnTaskInitialization !== workspace || typeof entry.id !== "string" || typeof entry.task !== "string" || !entry.task.length) continue;
+    try {
+      const messages = JSON.parse(await fs.readFile(path.join(storage, "tasks", entry.id, "ui_messages.json"), "utf8")) as Array<Record<string, unknown>>;
+      if (messages.at(-1)?.ask === "resume_task") unfinished.push({ sessionId: entry.id, prompt: entry.task, sourcePath: `cline-history:${entry.id}` });
+    } catch { /* Missing or transient task data is not safe to classify as unfinished. */ }
+  }
+  return unfinished;
+}
 
 export async function deleteLegacyQueuedTaskHistory(workspace: string, prompts: string[], knownTaskIds: string[], vscodeStorageOverride?: string): Promise<DeletedTaskHistory> {
   return deleteLegacyTaskHistory(workspace, entry => knownTaskIds.includes(String(entry.id)) || (typeof entry.task === "string" && prompts.includes(entry.task)), vscodeStorageOverride);

@@ -8,7 +8,7 @@ import type { IpcRequest, IpcResponse, WorkspaceRegistration } from "../ipc/type
 import type { ClineAdapter } from "../integrations/cline/types";
 import type { TaskQueue } from "./task_queue";
 import { getLatestLegacyWorkspaceTaskPrompt, getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, reconcileLegacyStatus } from "../integrations/cline/completion_monitor";
-import { deleteLegacyQueuedTaskHistory, deleteLegacyWorkspaceTaskHistory } from "../integrations/cline/task_history";
+import { deleteLegacyQueuedTaskHistory, deleteLegacyWorkspaceTaskHistory, getLegacyUnfinishedWorkspaceTasks } from "../integrations/cline/task_history";
 import { ensureRuntimeDirectory, registerWorkspace, socketPath, unregisterWorkspace, workspaceId } from "./workspace_registry";
 
 export class IpcServer {
@@ -80,6 +80,14 @@ export class IpcServer {
           if (!latest) throw new ClineConsoleError("TASK_NOT_FOUND", "No previous Cline task was found for this workspace.");
           await this.adapter.newTask(latest.prompt);
           result = { taskReloaded: true, previousTaskId: latest.sessionId };
+          break;
+        }
+        case "finishUnfinishedTasks": {
+          if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
+          const unfinished = await getLegacyUnfinishedWorkspaceTasks(expected);
+          const activity = await getLegacyWorkspaceActivity(expected);
+          if (activity.status === "waiting" && activity.sessionId && unfinished.some(task => task.sessionId === activity.sessionId)) await this.queue.skipWaitingTask(activity.sessionId);
+          result = { discovered: unfinished.length, ...await this.queue.enqueueUnfinished(unfinished) };
           break;
         }
         case "skipWaitingTask": {

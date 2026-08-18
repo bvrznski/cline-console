@@ -49,6 +49,7 @@ export function normalizeCommand(input: Parsed): NormalizedCommand {
     }
     if (action === "stop") return { parsed: { ...input, command: "tasks", commandArgs: ["stop", ...args] } };
     if (action === "restart") return { parsed: { ...input, command: "tasks", commandArgs: ["reload", ...args] } };
+    if (action === "finish") return { parsed: { ...input, command: "tasks", commandArgs: ["finish", ...args] } };
     throw new Error(`Unknown task action: ${action}`);
   }
   if (input.command === "workspace") {

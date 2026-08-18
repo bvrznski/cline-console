@@ -131,6 +131,7 @@ cline-console -w /repo task stop
 cline-console -w /repo task restart
 cline-console tasks
 cline-console -w /repo tasks
+cline-console -w /repo tasks finish
 ```
 
 `task start` accepts one input source. Use `queue add` for batches. If a task is
@@ -145,6 +146,12 @@ task after its current run ends.
 `task restart` retrieves the latest exact-workspace task from Cline history and
 uses its original full prompt. It never reconstructs a prompt from the console
 title.
+
+`tasks finish` finds exact-workspace history items whose current Cline record
+ends with `resume_task`, queues their original full prompts oldest-first, and
+deduplicates items already retained in queue history. Cline Legacy does not
+export its native History “Resume Task” action, so unfinished historical tasks
+are re-run through the normal queue rather than resumed in place.
 
 ### Queues
 

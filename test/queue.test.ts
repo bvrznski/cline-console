@@ -7,7 +7,7 @@ import { formatQueue, formatQueues } from "../src/client/commands/queue";
 import { discoverPersistedQueueStatuses, readQueueStatusFile, remainingTaskDispatchDelay, TaskQueue } from "../src/extension/task_queue";
 import type { ClineAdapter } from "../src/integrations/cline/types";
 import type { Logger } from "../src/common/logging";
-import { deleteLegacyQueuedTaskHistory, deleteLegacyWorkspaceTaskHistory } from "../src/integrations/cline/task_history";
+import { deleteLegacyQueuedTaskHistory, deleteLegacyWorkspaceTaskHistory, getLegacyUnfinishedWorkspaceTasks } from "../src/integrations/cline/task_history";
 
 const logger: Logger = { error() {}, info() {}, debug() {} };
 
@@ -81,6 +81,26 @@ test("persisted queues are discoverable without a live workspace registration", 
   assert.equal(statuses[0].items[0].title, "Offline task");
   assert.equal(JSON.stringify(statuses).includes("private body"), false);
   await fs.rm(root, { recursive: true });
+});
+
+test("unfinished task enqueue deduplicates retained Cline history IDs", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-queue-unfinished-")), file = path.join(root, "queue.json");
+  await fs.writeFile(file, JSON.stringify({ version: 1, workspace: "/repo", paused: true, items: [
+    { id: "existing", sourcePath: "cline-history:one", prompt: "First", state: "completed", queuedAt: "before" }
+  ] }));
+  const queue = new TaskQueue(file, "/repo", {} as ClineAdapter, logger);
+  try {
+    await queue.start();
+    const result = await queue.enqueueUnfinished([
+      { sourcePath: "cline-history:one", prompt: "First" },
+      { sourcePath: "cline-history:two", prompt: "Second" }
+    ]);
+    assert.deepEqual(result, { queued: 1, skippedExisting: 1, queueLength: 1 });
+    assert.equal(queue.getStatus().items[0].sourcePath, "cline-history:two");
+  } finally {
+    await queue.stop();
+    await fs.rm(root, { recursive: true });
+  }
 });
 
 test("queue formatter marks a persisted workspace whose companion is offline", () => {
@@ -157,6 +177,29 @@ test("workspace history clearance deletes every task only in the selected worksp
   const retained = JSON.parse(await fs.readFile(path.join(root, "state", "taskHistory.json"), "utf8")) as Array<{ id: string }>;
   assert.deepEqual(retained.map(item => item.id), ["other"]);
   assert.equal((await fs.stat(path.join(root, "tasks", "other"))).isDirectory(), true);
+  await fs.rm(root, { recursive: true });
+});
+
+test("unfinished history discovery selects exact-workspace resume prompts oldest first", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-history-unfinished-"));
+  await fs.mkdir(path.join(root, "state"), { recursive: true });
+  for (const id of ["one", "done", "resumed", "two", "other"]) await fs.mkdir(path.join(root, "tasks", id), { recursive: true });
+  await fs.writeFile(path.join(root, "state", "taskHistory.json"), JSON.stringify([
+    { id: "one", cwdOnTaskInitialization: "/repo", task: "First unfinished" },
+    { id: "done", cwdOnTaskInitialization: "/repo", task: "Completed" },
+    { id: "resumed", cwdOnTaskInitialization: "/repo", task: "Currently resumed" },
+    { id: "two", cwdOnTaskInitialization: "/repo", task: "Second unfinished" },
+    { id: "other", cwdOnTaskInitialization: "/other", task: "Wrong workspace" }
+  ]));
+  await fs.writeFile(path.join(root, "tasks", "one", "ui_messages.json"), JSON.stringify([{ ask: "resume_task" }]));
+  await fs.writeFile(path.join(root, "tasks", "done", "ui_messages.json"), JSON.stringify([{ ask: "completion_result" }]));
+  await fs.writeFile(path.join(root, "tasks", "resumed", "ui_messages.json"), JSON.stringify([{ ask: "resume_task" }, { say: "api_req_started" }]));
+  await fs.writeFile(path.join(root, "tasks", "two", "ui_messages.json"), JSON.stringify([{ ask: "resume_task" }]));
+  await fs.writeFile(path.join(root, "tasks", "other", "ui_messages.json"), JSON.stringify([{ ask: "resume_task" }]));
+  assert.deepEqual(await getLegacyUnfinishedWorkspaceTasks("/repo", root), [
+    { sessionId: "one", prompt: "First unfinished", sourcePath: "cline-history:one" },
+    { sessionId: "two", prompt: "Second unfinished", sourcePath: "cline-history:two" }
+  ]);
   await fs.rm(root, { recursive: true });
 });
 
