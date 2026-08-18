@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { ClineConsoleError } from "../src/common/errors";
 import type { WorkspaceRegistration } from "../src/ipc/types";
-import { resolveWorkspace, loadRegistrations, parseWorkspaceSelection } from "../src/client/ipc_client";
+import { resolveWorkspace, loadRegistrations, parseWorkspaceSelection, waitForWorkspaceRegistration } from "../src/client/ipc_client";
 import { ensureRuntimeDirectory, registerWorkspace } from "../src/extension/workspace_registry";
 
 const registration = (workspace: string, id: string): WorkspaceRegistration => ({ protocolVersion: 1, id, workspace, socketPath: `/tmp/${id}.sock`, pid: 1, registeredAt: new Date(0).toISOString() });
@@ -43,6 +43,16 @@ test("registry prunes records owned by dead processes", async () => {
   await fs.writeFile(path.join(root, "dead.json"), JSON.stringify({ ...registration(root, "dead"), pid: 2_147_483_647 }));
   assert.deepEqual(await loadRegistrations(root), []);
   await assert.rejects(fs.stat(path.join(root, "dead.json")));
+  await fs.rm(root, { recursive: true });
+});
+
+test("workspace registration wait bridges VS Code startup", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-startup-"));
+  const workspace = path.join(root, "workspace"), runtime = path.join(root, "runtime");
+  await fs.mkdir(workspace);
+  setTimeout(() => { void registerWorkspace(runtime, workspace); }, 30);
+  const item = await waitForWorkspaceRegistration(workspace, workspace, runtime, 500, 10);
+  assert.equal(item.workspace, workspace);
   await fs.rm(root, { recursive: true });
 });
 

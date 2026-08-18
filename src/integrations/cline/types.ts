@@ -13,9 +13,10 @@ export interface ClineStatus {
   connected: boolean;
   version?: string;
   task: "active" | "completed" | "failed" | "none" | "unknown";
-  state: "running" | "idle" | "completed" | "failed" | "submitted" | "cancelled" | "unknown";
+  state: "running" | "waiting" | "idle" | "completed" | "failed" | "submitted" | "cancelled" | "unknown";
   taskId?: string;
   title?: string;
+  sourcePath?: string;
   observedAt?: string;
   detail?: string;
 }

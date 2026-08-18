@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { Logger } from "../src/common/logging";
-import { getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, reconcileLegacyStatus, waitForLegacyMessageCompletion, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle } from "../src/integrations/cline/completion_monitor";
+import { getLatestLegacyWorkspaceTaskPrompt, getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, reconcileLegacyStatus, waitForLegacyMessageCompletion, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle } from "../src/integrations/cline/completion_monitor";
 
 const logger: Logger = { error() {}, info() {}, debug() {} };
 
@@ -13,7 +13,7 @@ test("completion monitor matches exact prompt, workspace, and terminal status", 
   const id = "session-1", directory = path.join(root, "data", "sessions", id);
   await fs.mkdir(directory, { recursive: true });
   await fs.writeFile(path.join(directory, `${id}.json`), JSON.stringify({ session_id: id, source: "vscode", workspace_root: "/repo", prompt: "exact\ntext", started_at: new Date().toISOString(), status: "completed", exit_code: 0 }));
-  assert.deepEqual(await waitForLegacyTaskCompletion("/repo", "exact\ntext", new Date(Date.now() - 1000).toISOString(), new AbortController().signal, logger, root), { sessionId: id, status: "completed", exitCode: 0 });
+  assert.deepEqual(await waitForLegacyTaskCompletion("/repo", "exact\ntext", new Date(Date.now() - 1000).toISOString(), new AbortController().signal, logger, root, undefined, { terminalStabilityMs: 0 }), { sessionId: id, status: "completed", exitCode: 0 });
   await fs.rm(root, { recursive: true });
 });
 
@@ -81,12 +81,36 @@ test("latest idle session replaces stale submitted bridge state with completed",
 });
 
 test("newer bridge submission wins over stale idle session metadata", () => {
+  const now = Date.parse("2026-08-10T10:00:10.000Z");
   const status = reconcileLegacyStatus(
     { connected: true, task: "active", state: "submitted", observedAt: "2026-08-10T10:00:00.000Z" },
-    { sessionId: "old", status: "idle", observedAt: "2026-08-10T09:00:00.000Z" }
+    { sessionId: "old", status: "idle", observedAt: "2026-08-10T09:00:00.000Z" },
+    now
   );
   assert.equal(status.task, "active");
   assert.equal(status.state, "submitted");
+});
+
+test("stale bridge submission cannot override completed Cline history", () => {
+  const status = reconcileLegacyStatus(
+    { connected: true, task: "active", state: "submitted", observedAt: "2026-08-10T10:00:00.000Z" },
+    { sessionId: "done", status: "completed", observedAt: "2026-08-10T09:00:00.000Z", title: "Finished task" },
+    Date.parse("2026-08-10T10:01:00.000Z")
+  );
+  assert.equal(status.task, "completed");
+  assert.equal(status.state, "completed");
+  assert.equal(status.taskId, "done");
+});
+
+test("stale bridge submission without Cline history expires", () => {
+  const status = reconcileLegacyStatus(
+    { connected: true, task: "active", state: "submitted", observedAt: "2026-08-10T10:00:00.000Z", title: "Old task" },
+    undefined,
+    Date.parse("2026-08-10T10:01:00.000Z")
+  );
+  assert.equal(status.task, "none");
+  assert.equal(status.state, "unknown");
+  assert.equal(status.title, undefined);
 });
 
 test("Cline UI task history distinguishes running from completed in the exact workspace", async () => {
@@ -109,6 +133,22 @@ test("Cline UI task history distinguishes running from completed in the exact wo
   await fs.rm(root, { recursive: true });
 });
 
+test("Cline resume prompt is incomplete but waiting rather than running", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-ui-waiting-"));
+  const clineRoot = path.join(root, "sessions-root"), storage = path.join(root, "storage"), id = "waiting-task";
+  await fs.mkdir(path.join(storage, "state"), { recursive: true });
+  await fs.mkdir(path.join(storage, "tasks", id), { recursive: true });
+  await fs.writeFile(path.join(storage, "state", "taskHistory.json"), JSON.stringify([{ id, cwdOnTaskInitialization: "/repo", task: "Incomplete task" }]));
+  await fs.writeFile(path.join(storage, "tasks", id, "ui_messages.json"), JSON.stringify([{ ts: 1, type: "ask", ask: "resume_task" }]));
+  const session = await getLegacyWorkspaceSessionStatus("/repo", clineRoot, storage);
+  assert.equal(session?.status, "waiting");
+  const status = reconcileLegacyStatus({ connected: true, task: "unknown", state: "unknown" }, session);
+  assert.equal(status.task, "active");
+  assert.equal(status.state, "waiting");
+  await waitForLegacyWorkspaceIdle("/repo", new AbortController().signal, logger, clineRoot, taskId => taskId === id, storage);
+  await fs.rm(root, { recursive: true });
+});
+
 test("queue completion monitor recognizes a completed Cline UI task", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-ui-queue-"));
   const clineRoot = path.join(root, "sessions-root"), storage = path.join(root, "storage"), id = String(Date.now()), prompt = "# Queued task\nBody";
@@ -116,7 +156,62 @@ test("queue completion monitor recognizes a completed Cline UI task", async () =
   await fs.mkdir(path.join(storage, "tasks", id), { recursive: true });
   await fs.writeFile(path.join(storage, "state", "taskHistory.json"), JSON.stringify([{ id, cwdOnTaskInitialization: "/repo", task: prompt }]));
   await fs.writeFile(path.join(storage, "tasks", id, "ui_messages.json"), JSON.stringify([{ ts: Date.now(), type: "ask", ask: "completion_result" }]));
-  const result = await waitForLegacyTaskCompletion("/repo", prompt, new Date(Date.now() - 1000).toISOString(), new AbortController().signal, logger, clineRoot, storage);
+  const result = await waitForLegacyTaskCompletion("/repo", prompt, new Date(Date.now() - 1000).toISOString(), new AbortController().signal, logger, clineRoot, storage, { terminalStabilityMs: 0 });
   assert.deepEqual(result, { sessionId: id, status: "completed" });
+  await fs.rm(root, { recursive: true });
+});
+
+test("queue completion requires a stable terminal signal and resets if Cline runs again", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-ui-stability-"));
+  const clineRoot = path.join(root, "sessions-root"), storage = path.join(root, "storage"), id = String(Date.now()), prompt = "Stability task";
+  await fs.mkdir(path.join(storage, "state"), { recursive: true });
+  await fs.mkdir(path.join(storage, "tasks", id), { recursive: true });
+  await fs.writeFile(path.join(storage, "state", "taskHistory.json"), JSON.stringify([{ id, cwdOnTaskInitialization: "/repo", task: prompt }]));
+  const messages = path.join(storage, "tasks", id, "ui_messages.json");
+  await fs.writeFile(messages, JSON.stringify([{ ask: "completion_result" }]));
+  setTimeout(() => { void fs.writeFile(messages, JSON.stringify([{ say: "api_req_started" }])); }, 20);
+  setTimeout(() => { void fs.writeFile(messages, JSON.stringify([{ ask: "completion_result" }])); }, 50);
+  const started = Date.now();
+  const result = await waitForLegacyTaskCompletion("/repo", prompt, new Date(Date.now() - 1000).toISOString(), new AbortController().signal, logger, clineRoot, storage, { terminalStabilityMs: 40, pollIntervalMs: 5 });
+  assert.deepEqual(result, { sessionId: id, status: "completed" });
+  assert.ok(Date.now() - started >= 85);
+  await fs.rm(root, { recursive: true });
+});
+
+test("queue completion monitor skips a task deleted from Cline history", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-ui-deleted-"));
+  const clineRoot = path.join(root, "sessions-root"), storage = path.join(root, "storage"), id = String(Date.now()), prompt = "Deleted queued task";
+  await fs.mkdir(path.join(storage, "state"), { recursive: true });
+  await fs.mkdir(path.join(storage, "tasks", id), { recursive: true });
+  const historyFile = path.join(storage, "state", "taskHistory.json");
+  await fs.writeFile(historyFile, JSON.stringify([{ id, cwdOnTaskInitialization: "/repo", task: prompt }]));
+  await fs.writeFile(path.join(storage, "tasks", id, "ui_messages.json"), JSON.stringify([{ ts: Date.now(), type: "say", say: "text" }]));
+  setTimeout(() => { void fs.writeFile(historyFile, "[]"); }, 30);
+  const result = await waitForLegacyTaskCompletion("/repo", prompt, new Date(Date.now() - 1000).toISOString(), new AbortController().signal, logger, clineRoot, storage, { deletionGraceMs: 1_000, pollIntervalMs: 10 });
+  assert.deepEqual(result, { sessionId: id, status: "deleted" });
+  await fs.rm(root, { recursive: true });
+});
+
+test("queue completion monitor skips an already-missing persisted task after grace", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-ui-missing-"));
+  const clineRoot = path.join(root, "sessions-root"), storage = path.join(root, "storage");
+  await fs.mkdir(path.join(storage, "state"), { recursive: true });
+  await fs.writeFile(path.join(storage, "state", "taskHistory.json"), "[]");
+  const result = await waitForLegacyTaskCompletion("/repo", "Missing task", new Date(Date.now() - 60_000).toISOString(), new AbortController().signal, logger, clineRoot, storage, { deletionGraceMs: 20, pollIntervalMs: 5 });
+  assert.deepEqual(result, { sessionId: "", status: "deleted" });
+  await fs.rm(root, { recursive: true });
+});
+
+test("latest task prompt is read from exact workspace Cline history", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-reload-"));
+  const storage = path.join(root, "storage");
+  await fs.mkdir(path.join(storage, "state"), { recursive: true });
+  await fs.writeFile(path.join(storage, "state", "taskHistory.json"), JSON.stringify([
+    { id: "other", cwdOnTaskInitialization: "/other", task: "wrong" },
+    { id: "old", cwdOnTaskInitialization: "/repo", task: "old prompt" },
+    { id: "latest", cwdOnTaskInitialization: "/repo", task: "# Reload me\nFull private prompt" }
+  ]));
+  assert.deepEqual(await getLatestLegacyWorkspaceTaskPrompt("/repo", path.join(root, "cline"), storage), { sessionId: "latest", prompt: "# Reload me\nFull private prompt" });
+  assert.equal(await getLatestLegacyWorkspaceTaskPrompt("/missing", path.join(root, "cline"), storage), undefined);
   await fs.rm(root, { recursive: true });
 });

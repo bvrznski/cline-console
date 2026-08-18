@@ -31,3 +31,31 @@ test("add directory recursively discovers regular files in deterministic relativ
 test("add rejects mixing file and directory modes", async () => {
   await assert.rejects(readTasks(["-f", "task.md", "-d", "tasks"]), /either -f files or -d directory/);
 });
+
+test("directory input filters files strictly newer than a reference file", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-newer-"));
+  const tasks = path.join(root, "tasks"), older = path.join(tasks, "older.md"), newer = path.join(tasks, "newer.md"), reference = path.join(root, "reference");
+  await fs.mkdir(tasks);
+  await fs.writeFile(older, "older");
+  await fs.writeFile(newer, "newer");
+  await fs.writeFile(reference, "reference");
+  await fs.utimes(older, new Date(1_000), new Date(1_000));
+  await fs.utimes(reference, new Date(2_000), new Date(2_000));
+  await fs.utimes(newer, new Date(3_000), new Date(3_000));
+  const result = await readTasks(["--dir", tasks, "--newer-than", reference]);
+  assert.deepEqual(result.map(task => task.sourcePath), [newer]);
+  await fs.rm(root, { recursive: true });
+});
+
+test("newer-than requires directory mode and at least one matching file", async () => {
+  await assert.rejects(readTasks(["--file", "task.md", "--newer-than", "reference"]), /valid only with --dir/);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-newer-empty-"));
+  const tasks = path.join(root, "tasks"), candidate = path.join(tasks, "task.md"), reference = path.join(root, "reference");
+  await fs.mkdir(tasks);
+  await fs.writeFile(candidate, "task");
+  await fs.writeFile(reference, "reference");
+  await fs.utimes(candidate, new Date(1_000), new Date(1_000));
+  await fs.utimes(reference, new Date(2_000), new Date(2_000));
+  await assert.rejects(readTasks(["--dir", tasks, "--newer-than", reference]), /No regular task files newer/);
+  await fs.rm(root, { recursive: true });
+});

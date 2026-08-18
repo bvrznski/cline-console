@@ -7,7 +7,8 @@ import { MAX_MESSAGE_BYTES, parseRequest, serializeResponse } from "../ipc/proto
 import type { IpcRequest, IpcResponse, WorkspaceRegistration } from "../ipc/types";
 import type { ClineAdapter } from "../integrations/cline/types";
 import type { TaskQueue } from "./task_queue";
-import { getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, reconcileLegacyStatus } from "../integrations/cline/completion_monitor";
+import { getLatestLegacyWorkspaceTaskPrompt, getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, reconcileLegacyStatus } from "../integrations/cline/completion_monitor";
+import { deleteLegacyQueuedTaskHistory, deleteLegacyWorkspaceTaskHistory } from "../integrations/cline/task_history";
 import { ensureRuntimeDirectory, registerWorkspace, socketPath, unregisterWorkspace, workspaceId } from "./workspace_registry";
 
 export class IpcServer {
@@ -74,9 +75,29 @@ export class IpcServer {
       let result: unknown;
       switch (request.action) {
         case "newTask": result = await this.adapter.newTask(requiredText(request.payload?.prompt, "prompt")); break;
+        case "reloadTask": {
+          const latest = await getLatestLegacyWorkspaceTaskPrompt(expected);
+          if (!latest) throw new ClineConsoleError("TASK_NOT_FOUND", "No previous Cline task was found for this workspace.");
+          await this.adapter.newTask(latest.prompt);
+          result = { taskReloaded: true, previousTaskId: latest.sessionId };
+          break;
+        }
+        case "skipWaitingTask": {
+          if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
+          result = await this.queue.skipWaitingTask(requiredText(request.payload?.sessionId, "sessionId"));
+          break;
+        }
         case "sendMessage": await this.adapter.sendMessage(requiredText(request.payload?.message, "message")); result = { messageSent: true }; break;
         case "cancelTask": await this.adapter.cancelTask(); result = { taskCancelled: true }; break;
-        case "status": result = reconcileLegacyStatus(await this.adapter.getStatus(), await getLegacyWorkspaceSessionStatus(expected)); break;
+        case "status": {
+          result = reconcileLegacyStatus(await this.adapter.getStatus(), await getLegacyWorkspaceSessionStatus(expected));
+          const latest = await getLatestLegacyWorkspaceTaskPrompt(expected);
+          if (this.queue && latest && latest.sessionId === (result as { taskId?: string }).taskId) {
+            const sourcePath = this.queue.sourcePathForPrompt(latest.prompt);
+            if (sourcePath) result = { ...(result as object), sourcePath };
+          }
+          break;
+        }
         case "capabilities": result = { version: await this.adapter.getVersion(), capabilities: await this.adapter.getCapabilities() }; break;
         case "enqueueTasks": {
           if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
@@ -94,6 +115,48 @@ export class IpcServer {
             throw new ClineConsoleError("INVALID_PAYLOAD", "messages must be a non-empty array of sourcePath/message/sessionId values.");
           }
           result = await this.queue.enqueueMessages(messages);
+          break;
+        }
+        case "replaceQueue": {
+          if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
+          const tasks = request.payload?.tasks;
+          if (!Array.isArray(tasks) || !tasks.length || tasks.some(task => typeof task.sourcePath !== "string" || typeof task.prompt !== "string" || !task.prompt.length)) {
+            throw new ClineConsoleError("INVALID_PAYLOAD", "tasks must be a non-empty array of sourcePath/prompt values.");
+          }
+          result = await this.queue.replace(tasks);
+          break;
+        }
+        case "clearQueue": {
+          if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
+          result = await this.queue.clear(async selectors => {
+            const latest = await getLatestLegacyWorkspaceTaskPrompt(expected);
+            if (latest && (selectors.taskIds.includes(latest.sessionId) || selectors.prompts.includes(latest.prompt))) await this.adapter.cancelTask();
+            return (await deleteLegacyQueuedTaskHistory(expected, selectors.prompts, selectors.taskIds)).deleted;
+          });
+          break;
+        }
+        case "clearWorkspace": {
+          if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
+          result = await this.queue.clear(async () => {
+            const latest = await getLatestLegacyWorkspaceTaskPrompt(expected);
+            if (latest) await this.adapter.cancelTask();
+            return (await deleteLegacyWorkspaceTaskHistory(expected)).deleted;
+          });
+          break;
+        }
+        case "popQueue": {
+          if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
+          result = await this.queue.pop(requiredText(request.payload?.selector, "selector"), request.payload?.resolvedSelector, request.payload?.selectorType);
+          break;
+        }
+        case "pauseQueue": {
+          if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
+          result = await this.queue.pause();
+          break;
+        }
+        case "resumeQueue": {
+          if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
+          result = await this.queue.resume();
           break;
         }
         case "queueStatus": {

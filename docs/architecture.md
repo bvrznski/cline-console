@@ -51,7 +51,11 @@ metadata only and deliberately omit task bodies.
 2. The worker waits while the exact workspace has a non-terminal Cline task.
 3. One task or follow-up message is dispatched through Cline's public API.
 4. The worker matches the exact workspace and prompt/session in Cline history.
-5. `completion_result` marks completion; then the next item is dispatched.
+5. `completion_result` starts a 60-second confirmation window. It marks
+   completion only if the task remains terminal throughout that window; resumed
+   execution resets the timer. If an observed queued task disappears
+   from Cline's exact-workspace history, it is marked skipped and the next item
+   is dispatched without the normal task-to-task cooldown.
 6. Queue state is persisted after every transition.
 
 ## Trust boundaries

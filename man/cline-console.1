@@ -1,0 +1,254 @@
+.TH CLINE-CONSOLE 1 "2026-08-11" "cline-console 0.13.0" "User Commands"
+.SH NAME
+cline-console \- control the Cline extension running in a VS Code workspace
+.SH SYNOPSIS
+.B cline-console
+.RI [ global-options ]
+.I resource action
+.RI [ action-options ]
+.SH DESCRIPTION
+.B cline-console
+is a local control plane for the Cline extension running inside VS Code.
+It routes terminal requests through one user service to a companion extension
+in the selected workspace. Cline remains the execution engine and continues to
+own providers, history, approvals, checkpoints, tools, terminals, and its user
+interface.
+.PP
+Resources are
+.BR task ,
+.BR queue ,
+.BR workspace ,
+and
+.BR service .
+.SH GLOBAL OPTIONS
+.TP
+.BR \-w ", " \-\-workspace " " path
+Select an exact registered workspace or a path contained inside one.
+.TP
+.B \-\-json
+Emit JSON for commands that support machine-readable output.
+.TP
+.B \-\-no-color
+Disable ANSI terminal colors.
+.TP
+.BI \-\-timeout " seconds"
+Set the timeout used by interactive collision prompts. The value must be
+positive. The default is 30 seconds.
+.TP
+.BR \-V ", " \-\-version
+Print the program version and exit.
+.TP
+.BR \-h ", " \-\-help
+Print command help and exit.
+.SH TASK COMMANDS
+.TP
+.B task start --file FILE
+Start one task using the exact UTF-8 contents of
+.IR FILE .
+.TP
+.B task start --text TEXT
+Start one task from inline text.
+.TP
+.B task start --stdin
+Read one task from standard input.
+.TP
+.B task send --file FILE
+Send a follow-up using the exact contents of
+.IR FILE .
+.TP
+.B task send --text TEXT
+Send an inline follow-up. A follow-up for a running task is persisted in the
+workspace FIFO; otherwise it is delivered immediately.
+.TP
+.B task status
+Display the latest reconciled task for one selected workspace, including its
+state, meaningful title, and matching queued source path when known.
+.TP
+.B tasks
+Display reconciled task state for all registered workspaces, or one workspace
+when
+.B --workspace
+is supplied.
+.TP
+.B task stop
+Stop the selected task through Cline's normal cancellation path. An explicit
+workspace is recommended and required when selection would be ambiguous.
+.TP
+.B task restart
+Restart the latest exact-workspace task using its original full prompt from
+Cline history.
+.TP
+.B task capabilities
+Display the detected Cline version and supported adapter operations.
+.SH QUEUE COMMANDS
+.TP
+.B queue list
+Display running and waiting FIFO entries. Without
+.BR --workspace ,
+all registered workspaces are shown.
+.TP
+.B queue add --file FILE...
+Append one or more files in supplied order.
+.TP
+.B queue add --dir DIRECTORY
+Append all regular files discovered recursively in deterministic relative-path
+order. Symbolic links are ignored.
+.TP
+.B queue add --dir DIRECTORY --newer-than REFERENCE_FILE
+Append only regular files whose modification time is strictly newer than the
+reference file. Deterministic relative-path order is retained.
+.TP
+.B queue add ... --resume
+Append the supplied batch and clear a persisted queue pause.
+.TP
+.B queue replace --file FILE...
+Replace all waiting entries with the supplied batch. A genuinely active running
+entry is preserved.
+.TP
+.B queue replace --dir DIRECTORY
+Replace waiting entries with the deterministically ordered directory contents.
+.TP
+.B queue replace --dir DIRECTORY --newer-than REFERENCE_FILE
+Replace waiting entries using the same strict modification-time filter.
+.TP
+.B queue remove --file PATH
+Remove one waiting entry by exact stored source path.
+.TP
+.B queue remove --title TITLE
+Remove one waiting entry by exact displayed title. Ambiguous titles are rejected.
+.TP
+.B queue remove --id ID
+Remove one waiting entry by queue ID.
+.TP
+.B queue pause
+Allow the current task to finish, then prevent the next task from dispatching.
+The pause is persisted.
+.TP
+.B queue resume
+Clear the persisted pause and resume FIFO processing.
+.TP
+.B queue clear
+Remove all waiting and running queue entries. Cancel an active task only when it
+exactly matches this queue, then delete matching task IDs from Cline history and
+per-task storage. Tasks from other workspaces and unrelated manual tasks are
+preserved.
+.PP
+Queued tasks must remain terminal for at least 60 seconds before completion is
+recorded. If execution resumes, that confirmation timer resets. The next task
+then waits 30 seconds after the confirmed completion or failure.
+Workspace activity, pause, clear, replacement, and removal state are rechecked
+before dispatch. Queued follow-up messages are not delayed.
+.SH WORKSPACE COMMANDS
+.TP
+.B workspace list
+List registered VS Code filesystem workspaces and their local endpoints.
+.TP
+.B workspace clear
+Require an explicit workspace, clear its entire queue, cancel its displayed
+Cline task, and delete all Cline history and per-task storage owned by that
+exact workspace. Other workspaces are preserved.
+.SH SERVICE COMMANDS
+.TP
+.B service install
+Install, enable, and start the singleton systemd user service.
+.TP
+.B service start
+Start the user service.
+.TP
+.B service stop
+Stop the user service.
+.TP
+.B service restart
+Restart the user service.
+.TP
+.B service status
+Report whether the service and local socket are available.
+.TP
+.B service run
+Run the singleton routing service in the foreground.
+.SH INTERACTIVE BEHAVIOR
+Starting a task while another task is active prompts to queue, interrupt and
+replace, or abort. Adding files while a task is incomplete and waiting prompts
+to restart that task from its original prompt, skip that exact task for queue
+processing, or abort. Timeout, EOF, and non-interactive input abort safely.
+.SH COMPATIBILITY
+Pre-0.12 commands including
+.BR new ,
+.BR send ,
+.BR add ,
+.BR resume ,
+.BR cancel ,
+.BR status ,
+.BR "task list" ,
+.BR workspaces ,
+bare
+.BR queue ,
+and
+.B queue pop
+remain operational as deprecated aliases. They print migration guidance and
+retain their previous behavior.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+Disable ANSI colors when set.
+.TP
+.B TERM
+The value
+.B dumb
+disables ANSI colors.
+.TP
+.B CLINE_DIR
+Override the Cline session metadata directory used for compatibility detection.
+.TP
+.B CLINE_VSCODE_STORAGE_DIR
+Override the Cline VS Code global-storage directory.
+.SH FILES
+.TP
+.I $XDG_RUNTIME_DIR/cline-console/service.sock
+Singleton user-service socket.
+.TP
+.I $XDG_RUNTIME_DIR/cline-console/queue-*.json
+Private persisted per-workspace queues.
+.TP
+.I ~/.local/state/cline-console/cline-console.log
+Default log file. Prompt and message bodies are not logged.
+.TP
+.I ~/.config/systemd/user/cline-console.service
+Generated systemd user unit.
+.SH EXIT STATUS
+.TP
+.B 0
+The command completed, including a safe user-selected or timeout abort.
+.TP
+.B 1
+Validation, routing, compatibility, workspace, or service failure.
+.SH EXAMPLES
+.PP
+Start a task from a file:
+.PP
+.nf
+cline-console -w /repo task start --file task.md
+.fi
+.PP
+Append and resume a batch:
+.PP
+.nf
+cline-console -w /repo queue add --file one.md two.md --resume
+.fi
+.PP
+Inspect every queue:
+.PP
+.nf
+cline-console queue list
+.fi
+.PP
+Remove one waiting item by ID:
+.PP
+.nf
+cline-console -w /repo queue remove --id 01274731-fd91-4f2f-a239-7917799b87ae
+.fi
+.SH SEE ALSO
+.BR code (1),
+.BR systemctl (1)
+.SH BUGS
+Report issues at https://github.com/bvrznski/cline-console/issues.

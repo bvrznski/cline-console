@@ -53,6 +53,20 @@ export async function resolveWorkspace(registrations: WorkspaceRegistration[], e
   throw new ClineConsoleError("AMBIGUOUS_WORKSPACE", "Multiple VS Code workspaces are registered. Use --workspace /path/to/repo.");
 }
 
+export async function waitForWorkspaceRegistration(explicit: string, cwd: string, directory = runtimeDirectory(), timeoutMs = 3_000, pollIntervalMs = 100): Promise<WorkspaceRegistration> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  do {
+    try { return await resolveWorkspace(await loadRegistrations(directory), explicit, cwd); }
+    catch (error) {
+      if (!(error instanceof ClineConsoleError) || (error.code !== "NO_WORKSPACES" && error.code !== "WORKSPACE_NOT_REGISTERED")) throw error;
+      lastError = error;
+    }
+    await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+  } while (Date.now() <= deadline);
+  throw lastError;
+}
+
 export function parseWorkspaceSelection(registrations: WorkspaceRegistration[], input: string): WorkspaceRegistration | undefined {
   const trimmed = input.trim();
   if (!trimmed) return undefined;

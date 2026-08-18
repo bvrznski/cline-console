@@ -1,6 +1,6 @@
 {
   "name": "cline-console",
-  "version": "0.4.1",
+  "version": "0.13.0",
   "description": "Local terminal control plane for the Cline VS Code extension",
   "publisher": "bvrznski",
   "displayName": "Cline Console",
@@ -29,6 +29,9 @@
   "bin": {
     "cline-console": "dist/src/client/cli.js"
   },
+  "man": [
+    "man/cline-console.1"
+  ],
   "engines": {
     "vscode": "^1.85.0",
     "node": ">=18"

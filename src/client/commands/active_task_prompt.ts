@@ -17,10 +17,11 @@ export async function promptForActiveTaskChoice(timeoutMs = 30_000): Promise<Act
   const readline = createInterface({ input: process.stdin, output: process.stdout });
   let timer: NodeJS.Timeout | undefined;
   const deadline = Date.now() + timeoutMs;
+  const timeoutSeconds = Math.ceil(timeoutMs / 1_000);
   try {
     while (Date.now() < deadline) {
       const remaining = deadline - Date.now();
-      const question = readline.question("Choose within 30 seconds [1-3]: ").catch(() => "");
+      const question = readline.question(`Choose within ${timeoutSeconds} seconds [1-3]: `).catch(() => "");
       const timeout = new Promise<string>(resolve => { timer = setTimeout(() => resolve(""), remaining); });
       const answer = await Promise.race([question, timeout]);
       if (timer) { clearTimeout(timer); timer = undefined; }

@@ -4,9 +4,9 @@ import { ClineConsoleError } from "../../common/errors";
 
 export async function readTaskFiles(args: string[]): Promise<Array<{ sourcePath: string; prompt: string }>> {
   const marker = args.findIndex(arg => arg === "-f" || arg === "--file");
-  if (marker < 0) throw new ClineConsoleError("MISSING_FILE", "add requires -f followed by one or more task files.");
+  if (marker < 0) throw new ClineConsoleError("MISSING_FILE", "-f must be followed by one or more task files.");
   const filenames = args.slice(marker + 1);
-  if (!filenames.length || filenames.some(name => name.startsWith("-"))) throw new ClineConsoleError("MISSING_FILE", "add -f requires one or more task files.");
+  if (!filenames.length || filenames.some(name => name.startsWith("-"))) throw new ClineConsoleError("MISSING_FILE", "-f requires one or more task files.");
   return Promise.all(filenames.map(async filename => {
     const sourcePath = await fs.realpath(path.resolve(filename));
     const prompt = await fs.readFile(sourcePath, "utf8");
@@ -16,18 +16,32 @@ export async function readTaskFiles(args: string[]): Promise<Array<{ sourcePath:
 }
 
 export async function readTasks(args: string[]): Promise<Array<{ sourcePath: string; prompt: string }>> {
-  const directoryMarker = args.findIndex(arg => arg === "-d" || arg === "--directory");
+  const directoryMarker = args.findIndex(arg => arg === "-d" || arg === "--dir" || arg === "--directory");
   const fileMarker = args.findIndex(arg => arg === "-f" || arg === "--file");
-  if (directoryMarker >= 0 && fileMarker >= 0) throw new ClineConsoleError("AMBIGUOUS_INPUT", "add accepts either -f files or -d directory, not both.");
+  const newerMarker = args.findIndex(arg => arg === "--newer-than");
+  if (directoryMarker >= 0 && fileMarker >= 0) throw new ClineConsoleError("AMBIGUOUS_INPUT", "Use either -f files or -d directory, not both.");
+  if (newerMarker >= 0 && directoryMarker < 0) throw new ClineConsoleError("INVALID_ARGUMENT", "--newer-than is valid only with --dir.");
   if (directoryMarker < 0) return readTaskFiles(args);
   const directoryArgument = args[directoryMarker + 1];
-  if (!directoryArgument) throw new ClineConsoleError("MISSING_DIRECTORY", "-d/--directory requires a path.");
-  if (args.length !== directoryMarker + 2) throw new ClineConsoleError("INVALID_ARGUMENT", "-d/--directory accepts exactly one directory path.");
+  if (!directoryArgument) throw new ClineConsoleError("MISSING_DIRECTORY", "-d/--dir requires a path.");
+  const expectedLength = newerMarker >= 0 ? 4 : 2;
+  if (args.length !== expectedLength) throw new ClineConsoleError("INVALID_ARGUMENT", "Use --dir DIRECTORY with an optional --newer-than REFERENCE_FILE.");
+  const referenceArgument = newerMarker >= 0 ? args[newerMarker + 1] : undefined;
+  if (newerMarker >= 0 && !referenceArgument) throw new ClineConsoleError("MISSING_FILE", "--newer-than requires a reference file.");
   const directory = await fs.realpath(path.resolve(directoryArgument));
   const stat = await fs.stat(directory);
   if (!stat.isDirectory()) throw new ClineConsoleError("NOT_A_DIRECTORY", `Not a directory: ${directory}`);
-  const files = await discoverRegularFiles(directory);
-  if (!files.length) throw new ClineConsoleError("EMPTY_DIRECTORY", `No regular task files found in directory: ${directory}`);
+  let files = await discoverRegularFiles(directory);
+  if (referenceArgument) {
+    const reference = await fs.realpath(path.resolve(referenceArgument));
+    const referenceStat = await fs.stat(reference);
+    if (!referenceStat.isFile()) throw new ClineConsoleError("NOT_A_FILE", `Reference is not a regular file: ${reference}`);
+    const candidates = await Promise.all(files.map(async file => ({ file, mtimeMs: (await fs.stat(file)).mtimeMs })));
+    files = candidates.filter(candidate => candidate.mtimeMs > referenceStat.mtimeMs).map(candidate => candidate.file);
+  }
+  if (!files.length) throw new ClineConsoleError("EMPTY_DIRECTORY", referenceArgument
+    ? `No regular task files newer than the reference file were found in: ${directory}`
+    : `No regular task files found in directory: ${directory}`);
   return readTaskFiles(["-f", ...files]);
 }
 

@@ -6,7 +6,7 @@ import type { Logger } from "../common/logging";
 import { MAX_MESSAGE_BYTES, parseRequest, serializeResponse } from "../ipc/protocol";
 import { requestOverSocket } from "../ipc/transport";
 import type { IpcResponse } from "../ipc/types";
-import { loadRegistrations, resolveWorkspace } from "../client/ipc_client";
+import { waitForWorkspaceRegistration } from "../client/ipc_client";
 import { ensureRuntimeDirectory, runtimeDirectory, workspaceId } from "../extension/workspace_registry";
 import { readQueueStatusFile } from "../extension/task_queue";
 import { getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, reconcileLegacyStatus } from "../integrations/cline/completion_monitor";
@@ -64,7 +64,7 @@ export class ClineConsoleService {
     let request;
     try { request = parseRequest(line); } catch (error) { this.writeError(socket, "unknown", error); return; }
     try {
-      const registration = await resolveWorkspace(await loadRegistrations(this.directory), request.workspace, request.workspace);
+      const registration = await waitForWorkspaceRegistration(request.workspace, request.workspace, this.directory);
       this.logger.info(`Routing ${request.action} request ${request.requestId} to ${registration.workspace}.`);
       if (request.action === "activity") {
         const result = await getLegacyWorkspaceActivity(registration.workspace);

@@ -3,10 +3,37 @@ import os from "node:os";
 import path from "node:path";
 import type { Logger } from "../../common/logging";
 import type { ClineStatus } from "./types";
+import { taskTitle } from "../../common/task_title";
 
 export interface CompletionResult { sessionId: string; status: string; exitCode?: number; }
-export interface WorkspaceActivity { active: boolean; sessionId?: string; status?: "running" | "idle" | "completed" | "failed"; }
+export interface TaskCompletionMonitorOptions { deletionGraceMs?: number; pollIntervalMs?: number; terminalStabilityMs?: number; }
+export interface WorkspaceActivity { active: boolean; sessionId?: string; status?: "running" | "waiting" | "idle" | "completed" | "failed"; }
 export interface WorkspaceSessionStatus { sessionId: string; status: string; observedAt: string; title?: string; exitCode?: number; }
+export interface WorkspaceTaskPrompt { sessionId: string; prompt: string; }
+export const BRIDGE_SUBMISSION_GRACE_MS = 30_000;
+
+export async function getLatestLegacyWorkspaceTaskPrompt(workspace: string, clineRootOverride?: string, vscodeStorageOverride?: string): Promise<WorkspaceTaskPrompt | undefined> {
+  const clineRoot = clineRootOverride || process.env.CLINE_DIR?.trim() || path.join(os.homedir(), ".cline");
+  const vscodeStorage = vscodeStorageOverride || process.env.CLINE_VSCODE_STORAGE_DIR?.trim() || path.join(os.homedir(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
+  try {
+    const history = JSON.parse(await fs.readFile(path.join(vscodeStorage, "state", "taskHistory.json"), "utf8")) as Array<Record<string, unknown>>;
+    const entry = [...history].reverse().find(item => item.cwdOnTaskInitialization === workspace && typeof item.id === "string" && typeof item.task === "string" && item.task.length > 0);
+    if (entry) return { sessionId: String(entry.id), prompt: String(entry.task) };
+  } catch { /* Fall back to Cline's session metadata. */ }
+  const directory = path.join(clineRoot, "data", "sessions");
+  let names: string[];
+  try { names = await fs.readdir(directory); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  names.sort().reverse();
+  for (const name of names.slice(0, 200)) {
+    try {
+      const value = JSON.parse(await fs.readFile(path.join(directory, name, `${name}.json`), "utf8")) as Record<string, unknown>;
+      if (value.source === "vscode" && value.workspace_root === workspace && typeof value.prompt === "string" && value.prompt.length > 0) {
+        return { sessionId: typeof value.session_id === "string" ? value.session_id : name, prompt: value.prompt };
+      }
+    } catch { /* A session may be atomically updating while inspected. */ }
+  }
+  return undefined;
+}
 
 export async function getLegacyWorkspaceSessionStatus(workspace: string, clineRootOverride?: string, vscodeStorageOverride?: string): Promise<WorkspaceSessionStatus | undefined> {
   const clineRoot = clineRootOverride || process.env.CLINE_DIR?.trim() || path.join(os.homedir(), ".cline");
@@ -35,16 +62,25 @@ async function getLegacyUiTaskStatus(workspace: string, storage: string): Promis
     const last = messages.at(-1);
     if (!last) return undefined;
     const terminal = last.ask === "completion_result" || last.say === "completion_result";
-    return { sessionId, status: terminal ? "completed" : "running", observedAt: metadata.mtime.toISOString(), title: firstLine(entry.task) };
+    const waiting = last.ask === "resume_task";
+    return { sessionId, status: terminal ? "completed" : waiting ? "waiting" : "running", observedAt: metadata.mtime.toISOString(), title: taskTitle(entry.task) };
   } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; return undefined; }
 }
 
-export function reconcileLegacyStatus(status: ClineStatus, session: WorkspaceSessionStatus | undefined): ClineStatus {
-  if (!session) return status;
-  if (status.task === "active" && status.state === "submitted" && status.observedAt && Date.parse(status.observedAt) > Date.parse(session.observedAt)) {
+export function reconcileLegacyStatus(status: ClineStatus, session: WorkspaceSessionStatus | undefined, now = Date.now()): ClineStatus {
+  const submittedAt = status.state === "submitted" && status.observedAt ? Date.parse(status.observedAt) : Number.NaN;
+  const submissionIsFresh = Number.isFinite(submittedAt) && now - submittedAt <= BRIDGE_SUBMISSION_GRACE_MS;
+  if (!session) {
+    if (status.task === "active" && status.state === "submitted" && !submissionIsFresh) {
+      return { ...status, task: "none", state: "unknown", taskId: undefined, title: undefined, detail: "Stale bridge submission expired without a matching Cline workspace task." };
+    }
+    return status;
+  }
+  if (status.task === "active" && status.state === "submitted" && submissionIsFresh && submittedAt > Date.parse(session.observedAt)) {
     return { ...status, title: session.title ?? status.title, detail: "Active bridge submission is newer than Cline's latest workspace session metadata." };
   }
   if (session.status === "running") return { ...status, task: "active", state: "running", taskId: session.sessionId, title: session.title, detail: "Status reconciled from Cline's latest workspace session metadata." };
+  if (session.status === "waiting") return { ...status, task: "active", state: "waiting", taskId: session.sessionId, title: session.title, detail: "Task is incomplete and waiting for Cline's resume action." };
   if (session.status === "failed" || (session.exitCode !== undefined && session.exitCode !== 0)) return { ...status, task: "failed", state: "failed", taskId: session.sessionId, title: session.title, detail: "Status reconciled from Cline's latest workspace session metadata." };
   if (session.status === "idle" || session.status === "completed") return { ...status, task: "completed", state: session.status, taskId: session.sessionId, title: session.title, detail: "Status reconciled from Cline's latest workspace session metadata." };
   return { ...status, task: "unknown", state: "unknown", taskId: session.sessionId, title: session.title, detail: `Latest Cline session has unrecognized status '${session.status}'.` };
@@ -52,7 +88,7 @@ export function reconcileLegacyStatus(status: ClineStatus, session: WorkspaceSes
 
 export async function getLegacyWorkspaceActivity(workspace: string, clineRootOverride?: string): Promise<WorkspaceActivity> {
   const session = await getLegacyWorkspaceSessionStatus(workspace, clineRootOverride);
-  if (!session || !(["running", "idle", "completed", "failed"] as string[]).includes(session.status)) return { active: false };
+  if (!session || !(["running", "waiting", "idle", "completed", "failed"] as string[]).includes(session.status)) return { active: false };
   return { active: true, sessionId: session.sessionId, status: session.status as WorkspaceActivity["status"] };
 }
 
@@ -80,62 +116,90 @@ async function readSession(directory: string, sessionId: string, workspace: stri
     const value = JSON.parse(raw) as Record<string, unknown>;
     if (value.source !== "vscode" || value.workspace_root !== workspace) return undefined;
     if (requireLiveRunning && value.status === "running" && !processExists(value.pid)) return undefined;
-    return { sessionId, status: String(value.status), observedAt: metadata.mtime.toISOString(), title: firstLine(value.prompt), ...(typeof value.exit_code === "number" ? { exitCode: value.exit_code } : {}) };
+    return { sessionId, status: String(value.status), observedAt: metadata.mtime.toISOString(), title: taskTitle(value.prompt), ...(typeof value.exit_code === "number" ? { exitCode: value.exit_code } : {}) };
   } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; return undefined; }
 }
 
-function firstLine(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const line = value.split(/\r?\n/, 1)[0].trim();
-  return line || undefined;
-}
-
-export async function waitForLegacyWorkspaceIdle(workspace: string, signal: AbortSignal, logger: Logger, clineRootOverride?: string): Promise<void> {
+export async function waitForLegacyWorkspaceIdle(workspace: string, signal: AbortSignal, logger: Logger, clineRootOverride?: string, isWaitingTaskIgnored: (sessionId: string) => boolean = () => false, vscodeStorageOverride?: string): Promise<void> {
   let announced = false;
   while (!signal.aborted) {
-    const current = await getLegacyWorkspaceSessionStatus(workspace, clineRootOverride);
-    if (current?.status !== "running") return;
+    const current = await getLegacyWorkspaceSessionStatus(workspace, clineRootOverride, vscodeStorageOverride);
+    if (current?.status !== "running" && current?.status !== "waiting") return;
+    if (current.status === "waiting" && isWaitingTaskIgnored(current.sessionId)) return;
     if (!announced) { logger.info(`Queue waiting for existing Cline session ${current.sessionId} in ${workspace}.`); announced = true; }
     await abortableDelay(5_000, signal);
   }
   throw new Error("Queue monitor stopped.");
 }
 
-export async function waitForLegacyTaskCompletion(workspace: string, prompt: string, dispatchedAt: string, signal: AbortSignal, logger: Logger, clineRootOverride?: string, vscodeStorageOverride?: string): Promise<CompletionResult> {
+export async function waitForLegacyTaskCompletion(workspace: string, prompt: string, dispatchedAt: string, signal: AbortSignal, logger: Logger, clineRootOverride?: string, vscodeStorageOverride?: string, options: TaskCompletionMonitorOptions = {}): Promise<CompletionResult> {
   const clineRoot = clineRootOverride || process.env.CLINE_DIR?.trim() || path.join(os.homedir(), ".cline");
   const vscodeStorage = vscodeStorageOverride || process.env.CLINE_VSCODE_STORAGE_DIR?.trim() || path.join(os.homedir(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
   const sessions = path.join(clineRoot, "data", "sessions");
   const earliest = Date.parse(dispatchedAt) - 5_000;
+  const deletionDeadline = Date.now() + (options.deletionGraceMs ?? 15_000);
+  const pollIntervalMs = options.pollIntervalMs ?? 5_000;
+  const terminalStabilityMs = options.terminalStabilityMs ?? 60_000;
+  let observedUiSessionId: string | undefined;
+  let terminalCandidate: { key: string; firstObservedAt: number; result: CompletionResult } | undefined;
   while (!signal.aborted) {
-    const uiMatch = await findMatchingUiTask(vscodeStorage, workspace, prompt, earliest);
-    if (uiMatch && uiMatch.status !== "running") {
-      logger.info(`Cline UI task ${uiMatch.sessionId} reached terminal status ${uiMatch.status}.`);
-      return uiMatch;
+    const uiLookup = await findMatchingUiTask(vscodeStorage, workspace, prompt, earliest);
+    const uiMatch = uiLookup.match;
+    if (uiMatch) observedUiSessionId = uiMatch.sessionId;
+    if (uiMatch) {
+      if (uiMatch.status === "running") terminalCandidate = undefined;
+      else {
+        terminalCandidate = updateTerminalCandidate(terminalCandidate, uiMatch, logger);
+        if (Date.now() - terminalCandidate.firstObservedAt >= terminalStabilityMs) {
+          logger.info(`Cline UI task ${uiMatch.sessionId} remained terminal for ${terminalStabilityMs}ms.`);
+          return uiMatch;
+        }
+      }
     }
-    const match = await findMatchingSession(sessions, workspace, prompt, earliest);
-    if (match && match.status !== "running") {
-      logger.info(`Cline session ${match.sessionId} reached terminal status ${match.status}.`);
-      return match;
+    if (uiLookup.historyAvailable && !uiMatch && (observedUiSessionId !== undefined || Date.now() >= deletionDeadline)) {
+      logger.info(`Queued Cline task${observedUiSessionId ? ` ${observedUiSessionId}` : ""} disappeared from workspace history; skipping it.`);
+      return { sessionId: observedUiSessionId ?? "", status: "deleted" };
     }
-    await abortableDelay(5_000, signal);
+    const match = uiMatch ? undefined : await findMatchingSession(sessions, workspace, prompt, earliest);
+    if (match) {
+      if (isTerminalStatus(match.status)) {
+        terminalCandidate = updateTerminalCandidate(terminalCandidate, match, logger);
+        if (Date.now() - terminalCandidate.firstObservedAt >= terminalStabilityMs) {
+          logger.info(`Cline session ${match.sessionId} remained terminal for ${terminalStabilityMs}ms.`);
+          return match;
+        }
+      } else terminalCandidate = undefined;
+    }
+    await abortableDelay(pollIntervalMs, signal);
   }
   throw new Error("Queue monitor stopped.");
 }
 
-async function findMatchingUiTask(storage: string, workspace: string, prompt: string, earliest: number): Promise<CompletionResult | undefined> {
+function isTerminalStatus(status: string): boolean {
+  return status === "completed" || status === "idle" || status === "failed";
+}
+
+function updateTerminalCandidate(candidate: { key: string; firstObservedAt: number; result: CompletionResult } | undefined, result: CompletionResult, logger: Logger) {
+  const key = `${result.sessionId}\0${result.status}\0${result.exitCode ?? ""}`;
+  if (candidate?.key === key) return candidate;
+  logger.info(`Cline task ${result.sessionId} reached ${result.status}; beginning terminal stability wait.`);
+  return { key, firstObservedAt: Date.now(), result };
+}
+
+async function findMatchingUiTask(storage: string, workspace: string, prompt: string, earliest: number): Promise<{ historyAvailable: boolean; match?: CompletionResult }> {
   try {
     const history = JSON.parse(await fs.readFile(path.join(storage, "state", "taskHistory.json"), "utf8")) as Array<Record<string, unknown>>;
     const entry = [...history].reverse().find(item =>
       item.cwdOnTaskInitialization === workspace && item.task === prompt && typeof item.id === "string" && Number(item.id) >= earliest
     );
-    if (!entry) return undefined;
+    if (!entry) return { historyAvailable: true };
     const sessionId = String(entry.id);
     const messages = JSON.parse(await fs.readFile(path.join(storage, "tasks", sessionId, "ui_messages.json"), "utf8")) as Array<Record<string, unknown>>;
     const last = messages.at(-1);
-    if (!last) return undefined;
+    if (!last) return { historyAvailable: true };
     const completed = last.ask === "completion_result" || last.say === "completion_result";
-    return { sessionId, status: completed ? "completed" : "running" };
-  } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; return undefined; }
+    return { historyAvailable: true, match: { sessionId, status: completed ? "completed" : "running" } };
+  } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { historyAvailable: false }; return { historyAvailable: false }; }
 }
 
 async function findMatchingSession(directory: string, workspace: string, prompt: string, earliest: number): Promise<CompletionResult | undefined> {

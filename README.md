@@ -1,182 +1,362 @@
 # cline-console
 
-`cline-console` is a local control plane for the Cline extension already running in VS Code. It submits tasks and follow-up messages to Cline's extension API, so Cline remains responsible for providers, LM Studio configuration, history, checkpoints, approvals, terminals, tools, and its visible UI.
-
-> `cline-console` does not run the standalone Cline CLI. It controls the Cline extension running inside VS Code.
-
-The project is pre-1.0 and currently verified on Linux with VS Code, systemd user
-services, Node.js 18+, and Cline Legacy 4.1.7. It is an independent project and
-is not affiliated with or endorsed by Cline or its maintainers.
-
-## Documentation
-
-- [CLI reference](docs/cli-reference.md)
-- [Architecture](docs/architecture.md)
-- [Operations and troubleshooting](docs/operations.md)
-- [Publishing checklist](docs/publishing.md)
-- [Cline compatibility evidence](docs/cline-legacy-4.1.6-integration.md)
-- [Contributing](CONTRIBUTING.md)
-- [Security policy](SECURITY.md)
-- [Changelog](CHANGELOG.md)
-
-## Architecture
+`cline-console` controls the Cline extension running inside VS Code from a
+terminal. It can start tasks, send follow-up messages, inspect task state, and
+run persistent per-workspace FIFO queues.
 
 ```text
-terminal CLI -> singleton cline-console user service
-             -> selected per-workspace Unix socket -> companion VS Code extension
-             -> Cline public extension API -> Cline controller/task/UI
+terminal CLI
+    -> singleton user service
+        -> selected VS Code workspace companion
+            -> Cline extension API
+                -> Cline task, provider, approvals, tools, and UI
 ```
 
-Each VS Code workspace registers a private Unix socket below `$XDG_RUNTIME_DIR/cline-console` (falling back to `~/.cache/cline-console`). Requests use a versioned newline-delimited JSON protocol. The directory is mode `0700`; registrations and sockets are mode `0600`. No TCP listener is created. Starting a task reveals and focuses Cline's normal sidebar before submission.
+`cline-console` is a control plane, not an alternative agent runtime. It does
+not call model providers directly, duplicate Cline's task loop, or use the
+standalone Cline CLI. Cline remains responsible for credentials, models,
+checkpoints, approvals, terminals, browser tools, and visible task execution.
+
+The project is pre-1.0, Linux-oriented, and currently verified with Node.js
+18+, VS Code, systemd user services, and Cline Legacy 4.1.7. It is independent
+and is not affiliated with or endorsed by Cline or its maintainers.
+
+## Features
+
+- Route commands to an exact VS Code filesystem workspace.
+- Start tasks from a file, inline text, or standard input.
+- Send messages immediately or queue them behind an active task.
+- Maintain persistent, ordered task queues independently for each workspace.
+- Add batches from explicit files or recursively from a directory.
+- Filter directory batches using a `--newer-than` reference file.
+- Pause, resume, replace, inspect, remove, and clear queued work.
+- Reconcile task state against Cline's exact-workspace history.
+- Keep queues visible while a VS Code companion is temporarily offline.
+- Run through one private, singleton systemd user service.
+- Produce aligned colored terminal output and JSON for automation.
+- Log operational metadata without logging prompt or message bodies.
+
+## Requirements
+
+- Linux with systemd user services
+- Node.js 18 or newer
+- VS Code 1.85 or newer
+- A compatible Cline extension; Cline Legacy 4.1.7 is the verified target
 
 ## Install from source
 
-Requirements: Linux, Node.js 18+, VS Code, and a compatible Cline Legacy extension.
-
 ```bash
+git clone https://github.com/bvrznski/cline-console.git
+cd cline-console
 npm install
 npm run build
 npm run package
-code --install-extension cline-console-0.4.1.vsix
+code --install-extension cline-console-0.13.0.vsix
 npm link
 cline-console service install
 ```
 
-Reload VS Code after installing. The companion starts automatically for filesystem workspaces.
+Reload each target VS Code window after installing the VSIX. The companion
+activates automatically when a filesystem workspace is open.
 
-For a future published release, install the CLI from npm and the companion from
-the VS Code Marketplace, then install the user service:
+Verify the installation:
 
 ```bash
-npm install --global cline-console
-cline-console service install
+cline-console --version
+cline-console service status
+cline-console workspace list
 ```
 
-## Usage
+`npm link` or a global npm installation also installs the section-1 manual:
 
 ```bash
-cline-console new -f task.md
-cline-console new "Implement the task described here"
-cat task.md | cline-console new -
-cline-console --workspace /path/to/repo add -f task_1.md task_2.md
-cline-console --workspace /path/to/repo add -d tasks/
-cline-console send -f continuation.md
-cline-console send "Continue and fix the remaining tests."
-cline-console cancel
-cline-console status
-cline-console status --json
-cline-console --workspace /path/to/repo tasks
+man cline-console
+```
+
+## Quick start
+
+Open the target repository in VS Code, then start a task:
+
+```bash
+cline-console -w /path/to/repository task start --file task.md
+```
+
+Append a batch and inspect it:
+
+```bash
+cline-console -w /path/to/repository queue add --file task-1.md task-2.md
+cline-console -w /path/to/repository queue list
+```
+
+List current task state:
+
+```bash
 cline-console tasks
-cline-console tasks --json
-cline-console queue
-cline-console --workspace /path/to/repo queue
-cline-console --workspace /path/to/repo queue --json
-cline-console capabilities
-cline-console workspaces
-cline-console service status
+cline-console -w /path/to/repository tasks
 ```
 
-`tasks` with `--workspace` checks one VS Code workspace; without it, it lists every registered workspace. Example:
+## Command reference
+
+The canonical syntax is:
 
 ```text
-Workspace              Task       State      Cline  Title
-/path/to/repository    completed  completed  4.1.7  # Build feature
+cline-console [GLOBAL_OPTIONS] RESOURCE ACTION [ACTION_OPTIONS]
 ```
 
-The `Task` column is the normalized result. `State` retains Cline's underlying task value, and `Title` is the first line of the original task prompt. A completed task remains open for follow-up messages.
+Global options may appear before or after the resource:
 
-`queue` displays running and waiting task/message entries across every registered
-workspace. Add `--workspace PATH` to scope the view to one workspace. It includes
-first-line titles and source paths but never prints full prompt bodies. Summary
-counts show retained completed/failed history.
+| Option | Meaning |
+| --- | --- |
+| `-w, --workspace PATH` | Select an exact workspace or a path inside it |
+| `--json` | Emit machine-readable output where supported |
+| `--no-color` | Disable ANSI colors |
+| `--timeout SECONDS` | Set interactive prompt timeout; default: 30 seconds |
+| `-V, --version` | Print the version |
+| `-h, --help` | Print command help |
 
-With multiple windows, select explicitly:
+### Tasks
 
 ```bash
-cline-console --workspace /absolute/path/to/repository new -f task.md
+cline-console -w /repo task start --file task.md
+cline-console -w /repo task start --text "Implement the requested change"
+cat task.md | cline-console -w /repo task start --stdin
+
+cline-console -w /repo task send --file follow-up.md
+cline-console -w /repo task send --text "Also update the tests"
+cline-console -w /repo task send --stdin
+
+cline-console -w /repo task status
+cline-console -w /repo task capabilities
+cline-console -w /repo task stop
+cline-console -w /repo task restart
+cline-console tasks
+cline-console -w /repo tasks
 ```
 
-Without `--workspace`, one registered VS Code window is selected automatically. When multiple windows are registered, an interactive terminal displays a numbered selection prompt. Empty or invalid selection cancels before files are read or tasks are added. Non-interactive commands fail safely and require an explicit `--workspace`; a workspace is never chosen arbitrarily.
+`task start` accepts one input source. Use `queue add` for batches. If a task is
+already active, an interactive terminal offers three choices for up to 30
+seconds: queue the new task, interrupt and replace the current task, or abort.
+Timeout, EOF, and non-interactive ambiguity abort before the input is submitted.
 
-When `new` targets a workspace with a live Cline task, it waits up to 30 seconds for an interactive choice:
+`task send` sends directly to an idle/completed task. When the task is still
+running, the message joins that workspace's FIFO and is delivered to the same
+task after its current run ends.
 
-```text
-1) Add the new task to the queue
-2) Interrupt the current task and replace it
-3) Abort
-```
+`task restart` retrieves the latest exact-workspace task from Cline history and
+uses its original full prompt. It never reconstructs a prompt from the console
+title.
 
-Choice 1 preserves the current task and queues the new file. Choice 2 uses Cline's normal clear/start transition. Choice 3, timeout, EOF, or non-interactive execution aborts before reading, queuing, or submitting the new task. Invalid answers may be corrected within the original 30-second deadline.
-
-`send` follows up on the current task. If that task is idle/completed, the message is delivered immediately. If it is still running, the message is appended to the same persistent FIFO queue and delivered to that task after its current run completes:
+### Queues
 
 ```bash
-cline-console --workspace /path/to/workspace send -f message.md
-cline-console --workspace /path/to/workspace send "Please also update the tests"
+# Append
+cline-console -w /repo queue add --file one.md two.md
+cline-console -w /repo queue add --dir tasks/
+cline-console -w /repo queue add --dir tasks/ --newer-than checkpoint.file
+cline-console -w /repo queue add --file next.md --resume
+
+# Replace waiting entries; preserve a genuinely running entry
+cline-console -w /repo queue replace --file one.md two.md
+cline-console -w /repo queue replace --dir replacement/
+cline-console -w /repo queue replace --dir replacement/ --newer-than checkpoint.file
+
+# Inspect and control
+cline-console queue list
+cline-console -w /repo queue list --json
+cline-console -w /repo queue pause
+cline-console -w /repo queue resume
+cline-console -w /repo queue clear
+
+# Remove one waiting entry
+cline-console -w /repo queue remove --file /absolute/path/to/task.md
+cline-console -w /repo queue remove --title "Displayed title"
+cline-console -w /repo queue remove --id UUID
 ```
 
-The command reports either `Message sent to completed Cline task.` or `Message queued for the active task.` No prompt is required for this decision.
+`queue add` preserves supplied file order. Directory traversal is recursive and
+sorted by relative path; symbolic links are ignored. `--newer-than FILE`
+includes only regular files whose modification time is strictly newer than the
+reference file. Files are read immediately and their exact UTF-8 contents are
+persisted in the queue.
 
-## Supported Cline versions
+`queue pause` lets the current item finish and stops before the next dispatch.
+`queue resume` clears that persisted boundary. `queue remove` affects one
+waiting item and rejects ambiguous titles; it never removes a running item.
 
-The compatibility adapter targets the public Legacy API found in locally installed Cline 4.1.7 and expected in the 4.1.6 family: `startNewTask` and `sendMessage`. Only 4.1.7 was present for source inspection on this machine; 4.1.6 must be verified by the manual checklist in `docs/cline-legacy-4.1.6-integration.md`.
+#### Completion safety
 
-The existing provider remains authoritative, including a local LM Studio backend. `cline-console` never reads or changes provider credentials.
+A queued task advances only after all of these conditions hold:
 
-## Status and cancellation limitations
+1. Cline reports a terminal result for the exact workspace and full prompt.
+2. The result remains continuously terminal for at least 60 seconds.
+3. Any resumed activity resets that 60-second confirmation timer.
+4. After confirmation, a separate 30-second inter-task cooldown completes.
+5. Workspace activity is checked again immediately before dispatch.
 
-Cline Legacy's exported API does not expose authoritative task status or cancellation. `cline-console` therefore reads Cline's own task history, matches `cwdOnTaskInitialization` to the exact workspace, and inspects the task's latest UI message. A terminal `completion_result` is completed; an unfinished API/tool/result stream is running. Timestamped session metadata remains a fallback. Cancellation invokes Cline's registered `cline.plusButtonClicked` command, whose Legacy implementation calls `controller.clearTask()` and opens the normal new-task UI. It never kills VS Code or LM Studio.
+Consequently, at least 90 seconds normally pass between the first terminal
+signal and the next task. Queued follow-up messages do not use the task-to-task
+cooldown. If an observed running queue task is deleted from Cline history, it is
+marked skipped and the next matching FIFO item may advance immediately.
 
-`tasks` queries one workspace when `--workspace PATH` is supplied, or every registered VS Code workspace when it is omitted. It reports the latest reconciled session state for each workspace.
+#### Clearing queues and history
 
-## Queued task files
+`queue clear` is destructive. It removes all waiting and running queue entries.
+It cancels the displayed Cline task only when that task exactly matches the
+queue by workspace and full prompt or recorded task ID. Matching Cline history
+records and per-task storage are deleted; unrelated manual tasks and other
+workspaces are preserved.
 
-`add` reads every file immediately, preserves its exact UTF-8 content, and appends the prompts to that workspace's persistent FIFO queue. Follow-up messages queued by `send` use this same queue, preserving task/message ordering:
+### Workspaces
 
 ```bash
-cline-console --workspace /path/from/cline-console-workspaces add -f task_1.md task_2.md
-cline-console --workspace /path/from/cline-console-workspaces add -d task-directory
-cline-console --workspace /path/from/cline-console-workspaces queue
+cline-console workspace list
+cline-console -w /repo workspace clear
 ```
 
-Directory mode recursively queues all regular files in deterministic relative-path order. Symbolic links are ignored so discovery cannot escape or duplicate the selected tree. An empty directory, empty task file, or mixed `-f`/`-d` invocation is rejected explicitly.
+`workspace list` shows registered VS Code workspaces. Queue listing can also
+discover persisted queues whose companions are temporarily offline.
 
-The companion waits for the workspace's current Cline task to finish, dispatches one queued prompt through Cline's public extension API, watches the matching workspace and full prompt in Cline's task history for a terminal `completion_result`, and then dispatches the next item. Legacy session metadata remains a fallback. Queue state is stored privately beside the workspace socket and survives extension-host reloads. A task waiting for user approval has no `completion_result`, so the next task is not dispatched prematurely.
+> **Warning:** `workspace clear` is the strongest destructive operation. It
+> clears the selected workspace's entire queue, cancels its displayed Cline
+> task, and deletes every Cline history record and task directory owned by that
+> exact workspace. It requires an explicit `--workspace` and preserves other
+> workspaces.
 
-## Logs
-
-CLI, IPC, adapter, and queue events are written without prompt bodies to:
-
-```text
-$XDG_STATE_HOME/cline-console/cline-console.log
-```
-
-The fallback is `~/.local/state/cline-console/cline-console.log`. The directory is mode `0700`, the log is mode `0600`, and the previous log is retained as `.1` after the active file exceeds 5 MiB.
-
-## Singleton service
-
-Operational CLI requests pass through one local user service at `$XDG_RUNTIME_DIR/cline-console/service.sock`. Install and start it once with:
+### Service
 
 ```bash
 cline-console service install
-```
-
-This creates and enables `~/.config/systemd/user/cline-console.service`. The Unix socket enforces the singleton atomically: a second `cline-console service run` fails while the first is live. Stale sockets are removed safely, but non-socket paths are never replaced.
-
-```bash
-cline-console service status
 cline-console service start
 cline-console service stop
 cline-console service restart
+cline-console service status
+cline-console service run
 ```
 
-The service is only a local router and queue control plane. Cline inside VS Code remains the execution engine.
+`service install` creates and enables
+`~/.config/systemd/user/cline-console.service`. Only one service may own the
+local routing socket. `service run` is intended for foreground diagnostics.
+
+## Workspace selection
+
+Use `-w` or `--workspace` for deterministic automation:
+
+```bash
+cline-console -w /absolute/path/to/repository queue list
+```
+
+Without it:
+
+- One registered VS Code workspace is selected automatically.
+- Multiple registered workspaces trigger a numbered prompt in an interactive
+  terminal.
+- Non-interactive ambiguity fails safely.
+- `queue list` aggregates persisted queues rather than prompting.
+
+Explicit workspace lookup retries briefly during VS Code activation, avoiding
+false “not registered” errors during normal startup.
+
+## Task and queue output
+
+`tasks` reports normalized task state, Cline's underlying state, Cline version,
+a meaningful first-line title, and the queued source path when known:
+
+```text
+Workspace  Task    State    Cline  Title             Source
+/repo      active  running  4.1.7  # Build feature   /tasks/build.md
+```
+
+`queue list` displays aligned position, type, state, title, and source columns.
+It never prints complete prompt bodies. JSON output is available for scripting.
+Colors are disabled automatically for redirected output, `TERM=dumb`, JSON,
+`NO_COLOR`, or `--no-color`.
+
+## Persistence and security
+
+| Data | Default location |
+| --- | --- |
+| Service socket | `$XDG_RUNTIME_DIR/cline-console/service.sock` |
+| Registrations and queues | `$XDG_RUNTIME_DIR/cline-console/` |
+| Log | `$XDG_STATE_HOME/cline-console/cline-console.log` |
+| User service | `~/.config/systemd/user/cline-console.service` |
+
+Fallbacks are `~/.cache/cline-console` for runtime data and
+`~/.local/state/cline-console` for logs. Runtime and log directories are mode
+`0700`; files and sockets are mode `0600`. No TCP listener is created.
+
+Queue files contain complete task/message content because that content must
+survive extension-host reloads. Logs contain operational metadata only and omit
+prompt bodies. The active log rotates at 5 MiB and retains one `.1` file.
+
+## Compatibility
+
+The adapter uses the `startNewTask` and `sendMessage` API verified in Cline
+Legacy 4.1.7. Status and completion are reconciled from Cline's persisted
+exact-workspace history because Legacy does not export authoritative lifecycle
+state. See [the compatibility evidence](docs/cline-legacy-4.1.6-integration.md)
+for implementation details and the 4.1.6 verification checklist.
+
+Older commands remain available with migration warnings, including `new`,
+`send`, `add`, `resume`, `cancel`, `status`, `task list`, `workspaces`, bare
+`queue`, and `queue pop`.
 
 ## Troubleshooting
 
-- “No running VS Code workspaces”: install/enable the companion, reload the target window, and open a folder workspace.
-- “Multiple VS Code workspaces”: pass `--workspace`.
-- “does not expose startNewTask/sendMessage”: the installed Cline build is incompatible; inspect `Cline Console` in VS Code's Output panel.
-- Socket problems: run “Cline Console: Stop Server”, then “Start Server” from the command palette. A server only removes a pre-existing path if it is a Unix socket.
+### Workspace is not registered
 
-Prompts are not logged. Set `cline-console.logLevel` to `debug` for connection diagnostics.
+1. Confirm the folder is open as a filesystem workspace in VS Code.
+2. Confirm the Cline Console companion is installed and enabled.
+3. Reload that VS Code window.
+4. Run `cline-console workspace list`.
+5. Check the **Cline Console** channel in VS Code's Output panel.
+
+### Service is unavailable
+
+```bash
+cline-console service status
+cline-console service restart
+systemctl --user status cline-console.service
+```
+
+### Queue appears offline
+
+`queue list` can read persisted state without a live companion. Read-only output
+will say `VS Code companion: offline`; mutations require the workspace companion
+to reconnect.
+
+### More diagnostics
+
+Set `cline-console.logLevel` to `debug` in VS Code and inspect:
+
+```text
+~/.local/state/cline-console/cline-console.log
+```
+
+## Development
+
+```bash
+npm install
+npm run build
+npm test
+npm run package
+npm run verify:release
+```
+
+`npm test` builds TypeScript and runs the Node test suite. `verify:release` also
+runs the dependency audit, npm package dry run, and VSIX content inspection.
+
+## Documentation
+
+- [CLI reference](docs/cli-reference.md)
+- [Manual page](man/cline-console.1)
+- [Architecture](docs/architecture.md)
+- [Operations and troubleshooting](docs/operations.md)
+- [Cline compatibility evidence](docs/cline-legacy-4.1.6-integration.md)
+- [Publishing checklist](docs/publishing.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
+
+## License
+
+See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
