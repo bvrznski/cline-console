@@ -55,6 +55,7 @@ test("canonical queue grammar preserves batches and explicit selectors", () => {
   assert.equal(add.resumeAfter, true);
   assert.deepEqual(normalizeCommand(parseArgs(["queue", "replace", "--dir", "tasks"])).parsed.commandArgs, ["--dir", "tasks"]);
   assert.deepEqual(normalizeCommand(parseArgs(["queue", "remove", "--id", "abc"])).parsed.commandArgs, ["pop", "abc", "id"]);
+  assert.deepEqual(normalizeCommand(parseArgs(["queue", "clear", "--force"])).parsed.commandArgs, ["clear", "--force"]);
 });
 
 test("workspace clear normalizes to the destructive scoped operation", () => {

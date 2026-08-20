@@ -147,11 +147,13 @@ task after its current run ends.
 uses its original full prompt. It never reconstructs a prompt from the console
 title.
 
-`tasks finish` finds exact-workspace history items whose current Cline record
-ends with `resume_task`, queues their original full prompts oldest-first, and
-deduplicates items already retained in queue history. Cline Legacy does not
-export its native History “Resume Task” action, so unfinished historical tasks
-are re-run through the normal queue rather than resumed in place.
+`tasks finish` finds exact-workspace history items whose latest readable
+completion explicitly declares remaining work or whose latest Cline task
+progress remains below its total (for example, `4/13`), queues their original full
+prompts oldest-first, and
+deduplicates items already retained in queue history. Historical recovery
+requires a compatible native `showTaskWithId` API and fails safely when it is
+absent; it never falls back to starting a replacement task.
 
 ### Queues
 
@@ -173,6 +175,7 @@ cline-console -w /repo queue list --json
 cline-console -w /repo queue pause
 cline-console -w /repo queue resume
 cline-console -w /repo queue clear
+cline-console -w /repo queue clear --force
 
 # Remove one waiting entry
 cline-console -w /repo queue remove --file /absolute/path/to/task.md
@@ -198,23 +201,48 @@ A queued task advances only after all of these conditions hold:
    session metadata cannot independently authorize completion.
 2. Cline records `completion_result`; `resume_task` remains incomplete and
    blocks the queue.
-3. The result remains continuously terminal for at least 60 seconds. Any
+3. The result remains continuously terminal for at least 30 seconds. Any
    resumed activity resets that confirmation timer.
-4. The completion body contains no explicit non-empty `Remaining`, `Remaining
-   work`, `Remaining tasks`, or `Remaining implementation required` section.
+4. The mandatory completion audit finds no incomplete task-progress counter and no
+   structured remaining, outstanding, pending, future, deferred, open,
+   incomplete, or partial-work declaration. A missing or truncated body is not
+   sufficient by itself to classify a task as incomplete.
 5. After confirmation, a separate 30-second inter-task cooldown completes.
 6. Workspace activity is checked again immediately before dispatch.
 
-Consequently, at least 90 seconds normally pass between the first terminal
+Consequently, at least 60 seconds normally pass between the first terminal
 signal and the next task. Queued follow-up messages do not use the task-to-task
 cooldown. If an observed running queue task is deleted from Cline history, it is
 marked skipped and the next matching FIFO item may advance immediately.
 
-If a completion result explicitly lists remaining work, the worker sends a
+If a completion result explicitly lists remaining work, the worker parses concrete
+unchecked, numbered, bulleted, inline, and incomplete-counter steps and sends them in a
 follow-up instructing that same task to finish and validate every remaining
 item. It retains the running queue entry and waits for a later complete result
 that no longer declares unfinished work. Empty declarations such as `None`,
 `N/A`, and `all completed` do not trigger a follow-up.
+
+If the task repeatedly claims completion while its task-progress report remains
+incomplete, the scanner keeps the same task thread and escalates the follow-up.
+It requires a stage-by-stage comparison with the complete original prompt,
+accurate progress updates, and implementation and validation of every remaining
+stage before another completion attempt. The escalation quotes the concrete
+steps parsed from task progress and the completion report, and explicitly flags
+incomplete entries that simultaneously claim `COMPLETED`, so the follow-up is
+tied to observable task state instead of generic wording.
+
+An unresolved Cline `Task failed:` error triggers `/compact` followed by
+`continue` in the same task, even when Cline follows the error with a
+`resume_task` prompt. The complete failure text and handled marker are retained
+in queue state and SQLite history, preventing repeated recovery for one error;
+a later real retry supersedes it.
+
+An explicit timeout from a recognized test command (`pytest`, `unittest`, npm,
+pnpm, Yarn, Cargo, Go, CTest, Maven, Gradle, RSpec, or `dotnet test`) also blocks
+completion. The scanner quotes the timed-out command and requires diagnosis,
+bounded timeout and cleanup behavior, regression coverage, and a successful
+rerun of the same test scope. A passing narrower command does not clear the
+original timeout, and a timeout is never treated as passing evidence.
 
 If Cline records an explicit provider context-window overflow error, the worker
 sends `/compact` to the same task, waits for compaction processing, and then
@@ -222,13 +250,22 @@ asks the task to continue from where it stopped. Each persisted overflow error
 is handled once. Ordinary context-window usage telemetry does not trigger
 automatic compaction.
 
+The workspace policy watcher explicitly forbids Cline's `new_task` handoff for
+all future tasks, including tasks started directly rather than through the
+queue. It answers each persisted handoff once with `/compact` followed by
+a direct same-thread completion instruction, and never dispatches the proposed
+handoff as a new task. Compaction and completion are persisted as separate
+recovery stages, so a temporarily blocked follow-up is retried without sending
+`/compact` repeatedly. Each send is bounded by a timeout and handled markers
+survive extension restarts.
+
 #### Clearing queues and history
 
-`queue clear` is destructive. It removes all waiting and running queue entries.
-It cancels the displayed Cline task only when that task exactly matches the
-queue by workspace and full prompt or recorded task ID. Matching Cline history
-records and per-task storage are deleted; unrelated manual tasks and other
-workspaces are preserved.
+`queue clear` removes all waiting and running cline-console queue entries but
+does not alter Cline history or cancel the displayed Cline task. Only
+`queue clear --force` additionally cancels an exact queue match and deletes its
+matching Cline history records and per-task storage. Unrelated manual tasks and
+other workspaces are preserved.
 
 ### Workspaces
 
@@ -240,11 +277,37 @@ cline-console -w /repo workspace clear
 `workspace list` shows registered VS Code workspaces. Queue listing can also
 discover persisted queues whose companions are temporarily offline.
 
-> **Warning:** `workspace clear` is the strongest destructive operation. It
-> clears the selected workspace's entire queue, cancels its displayed Cline
-> task, and deletes every Cline history record and task directory owned by that
-> exact workspace. It requires an explicit `--workspace` and preserves other
-> workspaces.
+`workspace clear` clears cline-console queue state for the selected workspace.
+It does not alter Cline history; history deletion is reserved exclusively for
+`queue clear --force`.
+
+### Durable history database
+
+cline-console maintains a private SQLite database independently of Cline's own
+history:
+
+```bash
+cline-console history path
+cline-console history list
+cline-console -w /repo history list --limit 200
+cline-console history show TASK_ID
+```
+
+The database defaults to
+`~/.local/share/cline-console/history.sqlite3`, with a `0700` parent directory
+and `0600` database. It uses foreign keys, WAL journaling, full synchronous
+commits, schema migrations, immutable full initial prompts and hashes, prompt
+snapshots, canonical workspaces, queue projections, task runs, Cline session
+IDs, recovery markers, errors, and append-only structured events. Events label
+their source and distinguish observations imported from Cline from state derived
+by cline-console.
+
+Cline remains authoritative for live UI/session state. SQLite is authoritative
+for cline-console's durable audit trail and identity mapping. During the initial
+migration, the existing JSON queue remains the live compatibility source and is
+transactionally mirrored into SQLite. Clearing a queue marks its historical
+projection `cleared`; it does not erase the audit record. `history show` is
+intentionally explicit because it displays the full stored initial prompt.
 
 ### Service
 

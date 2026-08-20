@@ -4,12 +4,34 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { formatQueue, formatQueues } from "../src/client/commands/queue";
-import { discoverPersistedQueueStatuses, readQueueStatusFile, remainingTaskDispatchDelay, TaskQueue } from "../src/extension/task_queue";
+import { discoverPersistedQueueStatuses, incompleteCompletionFollowup, readQueueStatusFile, remainingTaskDispatchDelay, TaskQueue, testTimeoutFollowup } from "../src/extension/task_queue";
 import type { ClineAdapter } from "../src/integrations/cline/types";
 import type { Logger } from "../src/common/logging";
 import { deleteLegacyQueuedTaskHistory, deleteLegacyWorkspaceTaskHistory, getLegacyUnfinishedWorkspaceTasks } from "../src/integrations/cline/task_history";
 
 const logger: Logger = { error() {}, info() {}, debug() {} };
+
+test("repeated incomplete completion claims require an original-stage audit", () => {
+  assert.doesNotMatch(incompleteCompletionFollowup(1), /repeatedly claimed completion/);
+  const remaining = ["Fix relative imports", "Create tests - COMPLETED", "Validate runtime startup"];
+  assert.match(incompleteCompletionFollowup(1, remaining), /scanner detected these concrete remaining steps/i);
+  const followup = incompleteCompletionFollowup(2, remaining);
+  assert.match(followup, /Re-read the complete original task prompt/);
+  assert.match(followup, /1\. \"Fix relative imports\"/);
+  assert.match(followup, /2\. \"Create tests - COMPLETED\"/);
+  assert.match(followup, /3\. \"Validate runtime startup\"/);
+  assert.match(followup, /resolve the contradiction/i);
+  assert.doesNotMatch(followup, /\"Inspect\"/);
+});
+
+test("test timeout follow-up requires bounded regression coverage and a full rerun", () => {
+  const followup = testTimeoutFollowup("python -m pytest tests -v");
+  assert.match(followup, /python -m pytest tests -v/);
+  assert.match(followup, /bounded timeout and cleanup path/);
+  assert.match(followup, /regression test/);
+  assert.match(followup, /not merely a narrower substitute/);
+  assert.match(followup, /do not reinterpret a timeout as a pass/i);
+});
 
 function adapterWithStatus(task: "active" | "none", state: "running" | "unknown"): ClineAdapter {
   return {
@@ -180,25 +202,44 @@ test("workspace history clearance deletes every task only in the selected worksp
   await fs.rm(root, { recursive: true });
 });
 
-test("unfinished history discovery selects exact-workspace resume prompts oldest first", async () => {
+test("unfinished history discovery selects explicit remaining-work reports oldest first", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-history-unfinished-"));
   await fs.mkdir(path.join(root, "state"), { recursive: true });
-  for (const id of ["one", "done", "resumed", "two", "other"]) await fs.mkdir(path.join(root, "tasks", id), { recursive: true });
+  for (const id of ["one", "done", "partial", "resumed", "progress", "two", "other"]) await fs.mkdir(path.join(root, "tasks", id), { recursive: true });
   await fs.writeFile(path.join(root, "state", "taskHistory.json"), JSON.stringify([
     { id: "one", cwdOnTaskInitialization: "/repo", task: "First unfinished" },
     { id: "done", cwdOnTaskInitialization: "/repo", task: "Completed" },
+    { id: "partial", cwdOnTaskInitialization: "/repo", task: "Partial completion" },
     { id: "resumed", cwdOnTaskInitialization: "/repo", task: "Currently resumed" },
+    { id: "progress", cwdOnTaskInitialization: "/repo", task: "Incomplete progress" },
     { id: "two", cwdOnTaskInitialization: "/repo", task: "Second unfinished" },
     { id: "other", cwdOnTaskInitialization: "/other", task: "Wrong workspace" }
   ]));
   await fs.writeFile(path.join(root, "tasks", "one", "ui_messages.json"), JSON.stringify([{ ask: "resume_task" }]));
-  await fs.writeFile(path.join(root, "tasks", "done", "ui_messages.json"), JSON.stringify([{ ask: "completion_result" }]));
-  await fs.writeFile(path.join(root, "tasks", "resumed", "ui_messages.json"), JSON.stringify([{ ask: "resume_task" }, { say: "api_req_started" }]));
+  await fs.writeFile(path.join(root, "tasks", "done", "ui_messages.json"), JSON.stringify([
+    { say: "completion_result", text: "All requested work is complete and validated." },
+    { ask: "completion_result" }
+  ]));
+  await fs.writeFile(path.join(root, "tasks", "partial", "ui_messages.json"), JSON.stringify([
+    { say: "completion_result", text: "### Remaining Stages (Future Work):\n- Implement stages 4-8" },
+    { ask: "completion_result" }
+  ]));
+  await fs.writeFile(path.join(root, "tasks", "resumed", "ui_messages.json"), JSON.stringify([
+    { say: "completion_result", text: "## Remaining work\n- Finish validation" },
+    { ask: "completion_result" },
+    { say: "api_req_started" }
+  ]));
+  await fs.writeFile(path.join(root, "tasks", "progress", "ui_messages.json"), JSON.stringify([
+    { say: "task_progress", text: "- [x] Analyze\n- [ ] Implement\n- [ ] Validate" },
+    { say: "completion_result", text: "Work completed." },
+    { ask: "completion_result" }
+  ]));
   await fs.writeFile(path.join(root, "tasks", "two", "ui_messages.json"), JSON.stringify([{ ask: "resume_task" }]));
   await fs.writeFile(path.join(root, "tasks", "other", "ui_messages.json"), JSON.stringify([{ ask: "resume_task" }]));
   assert.deepEqual(await getLegacyUnfinishedWorkspaceTasks("/repo", root), [
-    { sessionId: "one", prompt: "First unfinished", sourcePath: "cline-history:one" },
-    { sessionId: "two", prompt: "Second unfinished", sourcePath: "cline-history:two" }
+    { sessionId: "partial", prompt: "Partial completion", sourcePath: "cline-history:partial" },
+    { sessionId: "resumed", prompt: "Currently resumed", sourcePath: "cline-history:resumed" },
+    { sessionId: "progress", prompt: "Incomplete progress", sourcePath: "cline-history:progress" }
   ]);
   await fs.rm(root, { recursive: true });
 });

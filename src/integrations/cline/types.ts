@@ -28,6 +28,7 @@ export interface ClineAdapter {
   getVersion(): Promise<string | undefined>;
   getCapabilities(): Promise<ClineCapabilities>;
   newTask(prompt: string): Promise<TaskResult>;
+  resumeTask?(taskId: string): Promise<TaskResult>;
   sendMessage(message: string): Promise<void>;
   cancelTask(): Promise<void>;
   getStatus(): Promise<ClineStatus>;

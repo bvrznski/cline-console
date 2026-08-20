@@ -23,6 +23,7 @@ import { color, supportsColor } from "../common/terminal";
 import { normalizeCommand, parseArgs } from "./grammar";
 import { discoverPersistedQueueStatuses } from "../extension/task_queue";
 import { runtimeDirectory } from "../extension/workspace_registry";
+import { HistoryStore, historyDatabasePath } from "../history/history_store";
 
 export { normalizeCommand, parseArgs } from "./grammar";
 
@@ -38,9 +39,13 @@ Usage:
   cline-console --workspace PATH queue replace (--file FILE...|--dir DIRECTORY [--newer-than FILE])
   cline-console [OPTIONS] queue list
   cline-console --workspace PATH queue remove (--file PATH|--title TITLE|--id ID)
-  cline-console --workspace PATH queue clear|pause|resume
+  cline-console --workspace PATH queue clear [--force]
+  cline-console --workspace PATH queue pause|resume
   cline-console workspace list
   cline-console --workspace PATH workspace clear
+  cline-console [--workspace PATH] history list [--limit NUMBER]
+  cline-console history show TASK_ID
+  cline-console history path
   cline-console service install|start|stop|restart|status|run
 
 Options:
@@ -60,13 +65,14 @@ export async function run(argv = process.argv.slice(2)): Promise<number> {
   if (!parsed.command || parsed.command === "help" || parsed.command === "--help" || parsed.command === "-h") { process.stdout.write(HELP); return 0; }
   if (parsed.command === "version") { process.stdout.write(`${VERSION}\n`); return 0; }
   if (parsed.command === "service") return runServiceCommand(parsed.commandArgs);
+  if (parsed.command === "history") return runHistoryCommand(parsed.commandArgs, parsed.workspace, parsed.json);
   const registrations = await loadRegistrations();
   if (parsed.command === "workspaces" || parsed.command === "list") { process.stdout.write(`${formatWorkspaces(registrations)}\n`); return 0; }
   if (parsed.command === "workspaceClear") {
     if (!parsed.workspace) throw new Error("workspace clear requires --workspace PATH.");
     const target = await resolveWorkspace(registrations, parsed.workspace, process.cwd());
     const result = await invoke(target, "clearWorkspace") as { cleared: number; clearedWaiting: number; clearedStaleRunning: number; queueLength: number; historyDeleted: number };
-    process.stdout.write(parsed.json ? `${JSON.stringify({ workspace: target.workspace, ...result }, null, 2)}\n` : `Workspace: ${target.workspace}\nCleared waiting items: ${result.clearedWaiting}\nCleared running items: ${result.clearedStaleRunning}\nDeleted workspace Cline history tasks: ${result.historyDeleted}\nQueue length: ${result.queueLength}\n`);
+    process.stdout.write(parsed.json ? `${JSON.stringify({ workspace: target.workspace, ...result }, null, 2)}\n` : `Workspace: ${target.workspace}\nCleared waiting items: ${result.clearedWaiting}\nCleared running items: ${result.clearedStaleRunning}\nCline history: preserved\nQueue length: ${result.queueLength}\n`);
     return 0;
   }
   if (parsed.command === "tasks") {
@@ -102,9 +108,10 @@ export async function run(argv = process.argv.slice(2)): Promise<number> {
       if (!parsed.workspace) throw new Error(`queue ${operation.replace(/^--/, "")} requires --workspace PATH.`);
       const target = await resolveWorkspace(registrations, parsed.workspace, process.cwd());
       if (operation.endsWith("clear")) {
-        if (parsed.commandArgs.length !== 1) throw new Error("queue clear accepts no additional arguments.");
-        const result = await invoke(target, "clearQueue") as { cleared: number; clearedWaiting: number; clearedStaleRunning: number; queueLength: number; runningPreserved: boolean; historyDeleted: number };
-        process.stdout.write(parsed.json ? `${JSON.stringify({ workspace: target.workspace, ...result }, null, 2)}\n` : `Workspace: ${target.workspace}\nCleared waiting items: ${result.clearedWaiting}\nCleared running items: ${result.clearedStaleRunning}\nDeleted Cline history tasks: ${result.historyDeleted}\nQueue length: ${result.queueLength}\n`);
+        const force = parsed.commandArgs.length === 2 && parsed.commandArgs[1] === "--force";
+        if (parsed.commandArgs.length !== 1 && !force) throw new Error("queue clear accepts only the optional --force flag.");
+        const result = await invoke(target, "clearQueue", force ? { force: true } : undefined) as { cleared: number; clearedWaiting: number; clearedStaleRunning: number; queueLength: number; runningPreserved: boolean; historyDeleted: number };
+        process.stdout.write(parsed.json ? `${JSON.stringify({ workspace: target.workspace, ...result }, null, 2)}\n` : `Workspace: ${target.workspace}\nCleared waiting items: ${result.clearedWaiting}\nCleared running items: ${result.clearedStaleRunning}\n${force ? `Deleted Cline history tasks: ${result.historyDeleted}` : "Cline history: preserved"}\nQueue length: ${result.queueLength}\n`);
       } else if (operation.endsWith("pop")) {
         if ((parsed.commandArgs.length !== 2 && parsed.commandArgs.length !== 3) || !parsed.commandArgs[1]) throw new Error("queue remove requires one file path, displayed title, or queue ID.");
         const selector = parsed.commandArgs[1];
@@ -305,6 +312,44 @@ async function runServiceCommand(args: string[]): Promise<number> {
     return 0;
   }
   throw new Error(`Unknown service action: ${action}`);
+}
+
+async function runHistoryCommand(args: string[], workspace: string | undefined, jsonOutput: boolean): Promise<number> {
+  const action = args[0] ?? "list";
+  if (action === "path" && args.length === 1) { process.stdout.write(`${historyDatabasePath()}\n`); return 0; }
+  const store = new HistoryStore();
+  try {
+    if (action === "show") {
+      if (args.length !== 2) throw new Error("history show requires one task ID.");
+      const task = store.getTask(args[1]);
+      if (!task) throw new Error(`No history task matches ${args[1]}.`);
+      process.stdout.write(`${JSON.stringify(task, null, 2)}\n`);
+      return 0;
+    }
+    if (action === "list") {
+      let limit = 100;
+      if (args.length > 1) {
+        if (args.length !== 3 || args[1] !== "--limit" || !Number.isSafeInteger(Number(args[2])) || Number(args[2]) <= 0) throw new Error("history list accepts only --limit NUMBER.");
+        limit = Number(args[2]);
+      }
+      let canonicalWorkspace = workspace;
+      if (workspace) canonicalWorkspace = await fs.realpath(path.resolve(workspace));
+      const tasks = store.listTasks(canonicalWorkspace, limit);
+      if (jsonOutput) process.stdout.write(`${JSON.stringify(tasks, null, 2)}\n`);
+      else process.stdout.write(`${formatHistoryTasks(tasks)}\n`);
+      return 0;
+    }
+    throw new Error("history accepts list, show, or path.");
+  } finally { store.close(); }
+}
+
+function formatHistoryTasks(tasks: Array<Record<string, unknown>>): string {
+  if (!tasks.length) return "No cline-console history records found.";
+  const rows = tasks.map(task => [String(task.id), String(task.state ?? "recorded"), String(task.title), String(task.workspace), String(task.source_path)]);
+  const headers = ["ID", "State", "Title", "Workspace", "Source"];
+  const widths = headers.map((header, index) => Math.max(header.length, ...rows.map(row => row[index].length)));
+  const line = (row: string[]) => row.map((value, index) => value.padEnd(widths[index])).join("  ").trimEnd();
+  return [line(headers), widths.map(width => "-".repeat(width)).join("  "), ...rows.map(line)].join("\n");
 }
 
 function formatCapabilities(version: string | undefined, c: ClineCapabilities): string {

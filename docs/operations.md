@@ -70,7 +70,7 @@ cline-console --workspace /repo queue resume
 ```
 
 Normal task-to-task queue advancement first confirms terminal state for at
-least 60 seconds, then includes a 30-second cooldown. During
+least 30 seconds, then includes a 30-second cooldown. During
 that interval, `queue pause`, `queue clear`, and queue replacement remain
 effective before the next dispatch.
 
@@ -82,7 +82,9 @@ cline-console --workspace /repo queue clear
 
 The command also removes a stale queue entry marked `running` when the same
 workspace is not active in `cline-console --workspace /repo task status`. Active or
-unavailable status is preserved conservatively.
+unavailable status is preserved conservatively. It does not modify Cline
+history. Use `queue clear --force` only when matching queue tasks must also be
+removed from Cline history.
 
 ### Service socket is absent
 

@@ -56,18 +56,40 @@ metadata only and deliberately omit task bodies.
    is available. A `resume_task` marker remains incomplete. `completion_result`
    starts a 60-second confirmation window and marks completion only if the task
    remains terminal throughout that window; resumed execution resets the timer.
-   If the completion body contains an explicit non-empty `Remaining` or
-   `Remaining work` section, the worker sends a continuation instruction to the
-   same task and keeps the queue item active until a later complete result has
-   no declared remaining work.
+   Historical recovery items carry their original Cline session ID and dispatch
+   only through native history activation; they never fall back to
+   `startNewTask`. The latest Cline task-progress checklist and every readable completion body
+   pass through a mandatory audit. An incomplete progress count such as `4/13`, or structured
+   remaining, outstanding, pending, future, deferred, open, incomplete, or
+   partial-work declarations cause a continuation instruction to the same task.
+   Missing or truncated bodies are ambiguous and do not independently classify
+   a task as incomplete. The queue item remains active until a later completion
+   report contains no explicit unfinished-work declaration.
    An explicit provider context-window overflow error triggers `/compact` on
    that same task. After compaction finishes, the worker requests continuation
    and retains the queue item until normal completion. Each persisted error
    record is handled at most once; ordinary context-usage telemetry is ignored.
+   A workspace-wide policy watcher rejects every persisted `new_task` handoff,
+   including for directly started tasks, by issuing `/compact` and a same-thread
+   completion instruction. It persists the compaction and completion stages
+   separately and applies timeouts, allowing a blocked completion message to be
+   retried without repeatedly compacting the same task. Handled prompt markers
+   persist across extension restarts so the response is not duplicated.
    If an observed queued task disappears
    from Cline's exact-workspace history, it is marked skipped and the next item
    is dispatched without the normal task-to-task cooldown.
 6. Queue state is persisted after every transition.
+
+## Durable history
+
+Each workspace companion dual-writes queue transitions into a shared private
+SQLite WAL database. The schema separates immutable logical tasks, prompt
+snapshots, queue projections, execution attempts, Cline session identifiers,
+and append-only events. Event provenance distinguishes Cline observations from
+cline-console derivations and user/CLI actions. Cline remains authoritative for
+live execution; the database owns only cline-console identity, recovery, queue,
+and audit history. Existing JSON queues remain the compatibility execution
+source until a separately validated migration retires them.
 
 ## Trust boundaries
 

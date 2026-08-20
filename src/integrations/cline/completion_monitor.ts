@@ -6,7 +6,7 @@ import type { ClineStatus } from "./types";
 import { taskTitle } from "../../common/task_title";
 import { findLatestContextOverflow } from "./context_overflow";
 
-export interface CompletionResult { sessionId: string; status: string; exitCode?: number; completionText?: string; completionMarker?: string; recoveryMarker?: string; }
+export interface CompletionResult { sessionId: string; status: string; exitCode?: number; errorText?: string; failureMarker?: string; testTimeoutMarker?: string; timedOutCommand?: string; completionText?: string; taskProgressText?: string; completionMarker?: string; recoveryMarker?: string; }
 export interface TaskCompletionMonitorOptions {
   deletionGraceMs?: number;
   pollIntervalMs?: number;
@@ -14,12 +14,35 @@ export interface TaskCompletionMonitorOptions {
   knownSessionId?: string;
   afterCompletionMarker?: string;
   afterRecoveryMarker?: string;
+  afterFailureMarker?: string;
+  afterTestTimeoutMarker?: string;
   onSessionObserved?: (sessionId: string) => void | Promise<void>;
 }
 export interface WorkspaceActivity { active: boolean; sessionId?: string; status?: "running" | "waiting" | "idle" | "completed" | "failed"; }
-export interface WorkspaceSessionStatus { sessionId: string; status: string; observedAt: string; title?: string; exitCode?: number; }
+export interface WorkspaceSessionStatus { sessionId: string; status: string; observedAt: string; title?: string; exitCode?: number; errorText?: string; }
 export interface WorkspaceTaskPrompt { sessionId: string; prompt: string; }
+export interface NewTaskHandoff { sessionId: string; marker: string; text?: string; }
 export const BRIDGE_SUBMISSION_GRACE_MS = 30_000;
+
+export async function getLegacyNewTaskHandoff(workspace: string, vscodeStorageOverride?: string): Promise<NewTaskHandoff | undefined> {
+  const storage = vscodeStorageOverride || process.env.CLINE_VSCODE_STORAGE_DIR?.trim() || path.join(os.homedir(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
+  try {
+    const history = JSON.parse(await fs.readFile(path.join(storage, "state", "taskHistory.json"), "utf8")) as Array<Record<string, unknown>>;
+    const entry = [...history].reverse().find(item => item.cwdOnTaskInitialization === workspace && typeof item.id === "string");
+    if (!entry) return undefined;
+    const sessionId = String(entry.id);
+    const messages = JSON.parse(await fs.readFile(path.join(storage, "tasks", sessionId, "ui_messages.json"), "utf8")) as Array<Record<string, unknown>>;
+    let handoffIndex = -1;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].ask === "new_task") { handoffIndex = index; break; }
+    }
+    if (handoffIndex < 0) return undefined;
+    const alreadyRejected = messages.slice(handoffIndex + 1).some(message => typeof message.text === "string" && message.text.includes("Finish in this thread."));
+    if (alreadyRejected) return undefined;
+    const handoff = messages[handoffIndex];
+    return { sessionId, marker: `${sessionId}:${String(handoff.ts ?? handoffIndex)}`, ...(typeof handoff.text === "string" ? { text: handoff.text } : {}) };
+  } catch { return undefined; }
+}
 
 export async function getLatestLegacyWorkspaceTaskPrompt(workspace: string, clineRootOverride?: string, vscodeStorageOverride?: string): Promise<WorkspaceTaskPrompt | undefined> {
   const clineRoot = clineRootOverride || process.env.CLINE_DIR?.trim() || path.join(os.homedir(), ".cline");
@@ -70,9 +93,10 @@ async function getLegacyUiTaskStatus(workspace: string, storage: string): Promis
     const messages = JSON.parse(raw) as Array<Record<string, unknown>>;
     const last = messages.at(-1);
     if (!last) return undefined;
+    const failure = findUnresolvedTaskFailure(messages, sessionId);
     const terminal = last.ask === "completion_result" || last.say === "completion_result";
     const waiting = last.ask === "resume_task";
-    return { sessionId, status: terminal ? "completed" : waiting ? "waiting" : "running", observedAt: metadata.mtime.toISOString(), title: taskTitle(entry.task) };
+    return { sessionId, status: failure ? "failed" : terminal ? "completed" : waiting ? "waiting" : "running", observedAt: metadata.mtime.toISOString(), title: taskTitle(entry.task), ...(failure ? { errorText: failure.text } : {}) };
   } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; return undefined; }
 }
 
@@ -90,7 +114,7 @@ export function reconcileLegacyStatus(status: ClineStatus, session: WorkspaceSes
   }
   if (session.status === "running") return { ...status, task: "active", state: "running", taskId: session.sessionId, title: session.title, detail: "Status reconciled from Cline's latest workspace session metadata." };
   if (session.status === "waiting") return { ...status, task: "active", state: "waiting", taskId: session.sessionId, title: session.title, detail: "Task is incomplete and waiting for Cline's resume action." };
-  if (session.status === "failed" || (session.exitCode !== undefined && session.exitCode !== 0)) return { ...status, task: "failed", state: "failed", taskId: session.sessionId, title: session.title, detail: "Status reconciled from Cline's latest workspace session metadata." };
+  if (session.status === "failed" || (session.exitCode !== undefined && session.exitCode !== 0)) return { ...status, task: "failed", state: "failed", taskId: session.sessionId, title: session.title, detail: session.errorText ?? "Status reconciled from Cline's latest workspace session metadata." };
   if (session.status === "idle" || session.status === "completed") return { ...status, task: "completed", state: session.status, taskId: session.sessionId, title: session.title, detail: "Status reconciled from Cline's latest workspace session metadata." };
   return { ...status, task: "unknown", state: "unknown", taskId: session.sessionId, title: session.title, detail: `Latest Cline session has unrecognized status '${session.status}'.` };
 }
@@ -148,17 +172,17 @@ export async function waitForLegacyTaskCompletion(workspace: string, prompt: str
   const earliest = Date.parse(dispatchedAt) - 5_000;
   const deletionDeadline = Date.now() + (options.deletionGraceMs ?? 15_000);
   const pollIntervalMs = options.pollIntervalMs ?? 5_000;
-  const terminalStabilityMs = options.terminalStabilityMs ?? 60_000;
+  const terminalStabilityMs = options.terminalStabilityMs ?? 30_000;
   let observedUiSessionId = options.knownSessionId;
   let terminalCandidate: { key: string; firstObservedAt: number; result: CompletionResult } | undefined;
   while (!signal.aborted) {
-    const uiLookup = await findMatchingUiTask(vscodeStorage, workspace, prompt, earliest, observedUiSessionId, options.afterRecoveryMarker);
+    const uiLookup = await findMatchingUiTask(vscodeStorage, workspace, prompt, earliest, observedUiSessionId, options.afterRecoveryMarker, options.afterFailureMarker, options.afterTestTimeoutMarker);
     const uiMatch = uiLookup.match;
     if (uiMatch && uiMatch.sessionId !== observedUiSessionId) {
       observedUiSessionId = uiMatch.sessionId;
       await options.onSessionObserved?.(uiMatch.sessionId);
     }
-    if (uiMatch?.status === "context_overflow") return uiMatch;
+    if (uiMatch?.status === "context_overflow" || uiMatch?.status === "task_failed" || uiMatch?.status === "test_timeout") return uiMatch;
     if (uiMatch) {
       if (uiMatch.status === "running" || uiMatch.status === "waiting" || uiMatch.completionMarker === options.afterCompletionMarker) terminalCandidate = undefined;
       else {
@@ -203,7 +227,7 @@ function updateTerminalCandidate(candidate: { key: string; firstObservedAt: numb
   return { key, firstObservedAt: Date.now(), result };
 }
 
-async function findMatchingUiTask(storage: string, workspace: string, prompt: string, earliest: number, knownSessionId?: string, afterRecoveryMarker?: string): Promise<{ historyAvailable: boolean; match?: CompletionResult }> {
+async function findMatchingUiTask(storage: string, workspace: string, prompt: string, earliest: number, knownSessionId?: string, afterRecoveryMarker?: string, afterFailureMarker?: string, afterTestTimeoutMarker?: string): Promise<{ historyAvailable: boolean; match?: CompletionResult }> {
   try {
     const history = JSON.parse(await fs.readFile(path.join(storage, "state", "taskHistory.json"), "utf8")) as Array<Record<string, unknown>>;
     const entry = [...history].reverse().find(item => item.cwdOnTaskInitialization === workspace && typeof item.id === "string" && (
@@ -218,19 +242,75 @@ async function findMatchingUiTask(storage: string, workspace: string, prompt: st
     if (overflow && overflow.marker !== afterRecoveryMarker) {
       return { historyAvailable: true, match: { sessionId, status: "context_overflow", recoveryMarker: overflow.marker } };
     }
+    const failure = findUnresolvedTaskFailure(messages, sessionId);
+    if (failure && failure.marker !== afterFailureMarker) {
+      return { historyAvailable: true, match: { sessionId, status: "task_failed", errorText: failure.text, failureMarker: failure.marker } };
+    }
     const completed = last.ask === "completion_result" || last.say === "completion_result";
     const waiting = last.ask === "resume_task";
+    const testTimeout = completed ? findUnresolvedTestTimeout(messages, sessionId, String(last.ts ?? messages.length)) : undefined;
+    if (testTimeout) {
+      if (testTimeout.marker !== afterTestTimeoutMarker) return { historyAvailable: true, match: { sessionId, status: "test_timeout", testTimeoutMarker: testTimeout.marker, timedOutCommand: testTimeout.command, errorText: testTimeout.text } };
+      return { historyAvailable: true, match: { sessionId, status: "waiting" } };
+    }
     const completion = completed ? [...messages].reverse().find(message =>
       (message.ask === "completion_result" || message.say === "completion_result") && typeof message.text === "string"
+    ) : undefined;
+    const taskProgress = completed ? [...messages].reverse().find(message =>
+      (message.ask === "task_progress" || message.say === "task_progress") && typeof message.text === "string"
     ) : undefined;
     const markerPart = String(last.ts ?? messages.length);
     return { historyAvailable: true, match: {
       sessionId,
       status: completed ? "completed" : waiting ? "waiting" : "running",
       ...(completed ? { completionMarker: `${sessionId}:${markerPart}` } : {}),
-      ...(typeof completion?.text === "string" ? { completionText: completion.text } : {})
+      ...(typeof completion?.text === "string" ? { completionText: completion.text } : {}),
+      ...(typeof taskProgress?.text === "string" ? { taskProgressText: taskProgress.text } : {})
     } };
   } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { historyAvailable: false }; return { historyAvailable: false }; }
+}
+
+export function findUnresolvedTestTimeout(messages: Array<Record<string, unknown>>, sessionId: string, completionPart = "completion"): { marker: string; command: string; text: string } | undefined {
+  const successful = new Set<string>();
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const text = typeof messages[index].text === "string" ? messages[index].text as string : "";
+    const command = extractExecutedCommand(text);
+    if (!command || !isTestCommand(command)) continue;
+    const signature = testCommandSignature(command);
+    if (/\bCommand executed\.\s*(?:\r?\n)?Output:/i.test(text)) successful.add(signature);
+    if (/\bCommand execution timed out after\s+\d+(?:\.\d+)?\s+seconds?\b/i.test(text) && !successful.has(signature)) {
+      return { marker: `${sessionId}:${String(messages[index].ts ?? index)}:${completionPart}`, command, text: timeoutSummary(text) };
+    }
+  }
+  return undefined;
+}
+
+function extractExecutedCommand(text: string): string | undefined {
+  const match = text.match(/\[execute_command for '([\s\S]*?)'\]\s+Result:/i);
+  return match?.[1].trim();
+}
+
+function isTestCommand(command: string): boolean {
+  return /(?:^|[;&|\s])(?:python\d*\s+-m\s+)?pytest\b|\bpython\d*\s+-m\s+unittest\b|\b(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b|\b(?:cargo|go|dotnet)\s+test\b|\bctest\b|\b(?:mvn|gradle)\b[^\n;&|]*\btest\b|\brspec\b/i.test(command);
+}
+
+function testCommandSignature(command: string): string {
+  return command.toLowerCase().replace(/\btimeout\s+\S+\s+/g, "").replace(/\s+(?:2?>&?1|[|>]\s*[^;&]+).*$/s, "").replace(/\s+/g, " ").trim();
+}
+
+function timeoutSummary(text: string): string {
+  return text.match(/Command execution timed out after\s+\d+(?:\.\d+)?\s+seconds?\.?/i)?.[0] ?? "Test command timed out.";
+}
+
+function findUnresolvedTaskFailure(messages: Array<Record<string, unknown>>, sessionId: string): { marker: string; text: string } | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.say === "api_req_started" || message.say === "user_feedback" || message.ask === "completion_result" || message.say === "completion_result") return undefined;
+    if (message.say === "error" && typeof message.text === "string" && /\bTask failed\s*:/i.test(message.text)) {
+      return { marker: `${sessionId}:${String(message.ts ?? index)}`, text: message.text };
+    }
+  }
+  return undefined;
 }
 
 async function findMatchingSession(directory: string, workspace: string, prompt: string, earliest: number): Promise<CompletionResult | undefined> {

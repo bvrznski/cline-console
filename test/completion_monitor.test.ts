@@ -4,9 +4,25 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { Logger } from "../src/common/logging";
-import { getLatestLegacyWorkspaceTaskPrompt, getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, reconcileLegacyStatus, waitForLegacyMessageCompletion, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle } from "../src/integrations/cline/completion_monitor";
+import { findUnresolvedTestTimeout, getLatestLegacyWorkspaceTaskPrompt, getLegacyNewTaskHandoff, getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, reconcileLegacyStatus, waitForLegacyMessageCompletion, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle } from "../src/integrations/cline/completion_monitor";
 
 const logger: Logger = { error() {}, info() {}, debug() {} };
+
+test("test-timeout detector requires a successful rerun of the same scope", () => {
+  const timeout = { ts: 10, say: "api_req_started", text: "[execute_command for 'npm test'] Result:\nCommand execution timed out after 30 seconds." };
+  assert.deepEqual(findUnresolvedTestTimeout([timeout], "task", "done"), {
+    marker: "task:10:done", command: "npm test", text: "Command execution timed out after 30 seconds."
+  });
+  assert.equal(findUnresolvedTestTimeout([timeout, {
+    ts: 11, say: "api_req_started", text: "[execute_command for 'npm test'] Result:\nCommand executed.\nOutput:\n93 tests passed"
+  }], "task", "done"), undefined);
+  assert.notEqual(findUnresolvedTestTimeout([timeout, {
+    ts: 12, say: "api_req_started", text: "[execute_command for 'npm test -- --runInBand other.test.ts'] Result:\nCommand executed.\nOutput:\n1 test passed"
+  }], "task", "done"), undefined);
+  assert.equal(findUnresolvedTestTimeout([{
+    ts: 13, say: "api_req_started", text: "[execute_command for 'python -c \"import package\"'] Result:\nCommand execution timed out after 30 seconds."
+  }], "task", "done"), undefined);
+});
 
 test("completion monitor matches exact prompt, workspace, and terminal status", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-completion-"));
@@ -149,16 +165,69 @@ test("Cline resume prompt is incomplete but waiting rather than running", async 
   await fs.rm(root, { recursive: true });
 });
 
+test("Cline Task failed error requests recovery even when followed by resume_task", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-ui-failed-"));
+  const clineRoot = path.join(root, "sessions-root"), storage = path.join(root, "storage"), id = String(Date.now()), prompt = "Failure task";
+  await fs.mkdir(path.join(storage, "state"), { recursive: true });
+  await fs.mkdir(path.join(storage, "tasks", id), { recursive: true });
+  await fs.writeFile(path.join(storage, "state", "taskHistory.json"), JSON.stringify([{ id, cwdOnTaskInitialization: "/repo", task: prompt }]));
+  await fs.writeFile(path.join(storage, "tasks", id, "ui_messages.json"), JSON.stringify([
+    { ts: 41, type: "say", say: "error", text: "[YOLO MODE] Task failed: Too many consecutive mistakes (3)." },
+    { ts: 42, type: "ask", ask: "resume_task" }
+  ]));
+  const session = await getLegacyWorkspaceSessionStatus("/repo", clineRoot, storage);
+  assert.equal(session?.status, "failed");
+  assert.equal(session?.errorText, "[YOLO MODE] Task failed: Too many consecutive mistakes (3).");
+  const result = await waitForLegacyTaskCompletion("/repo", prompt, new Date(Date.now() - 1_000).toISOString(), new AbortController().signal, logger, clineRoot, storage, { terminalStabilityMs: 0 });
+  assert.equal(result.status, "task_failed");
+  assert.equal(result.failureMarker, `${id}:41`);
+  assert.equal(result.errorText, "[YOLO MODE] Task failed: Too many consecutive mistakes (3).");
+  await fs.rm(root, { recursive: true });
+});
+
+test("a later Cline retry supersedes an earlier Task failed error", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-ui-failed-retry-"));
+  const clineRoot = path.join(root, "sessions-root"), storage = path.join(root, "storage"), id = String(Date.now());
+  await fs.mkdir(path.join(storage, "state"), { recursive: true });
+  await fs.mkdir(path.join(storage, "tasks", id), { recursive: true });
+  await fs.writeFile(path.join(storage, "state", "taskHistory.json"), JSON.stringify([{ id, cwdOnTaskInitialization: "/repo", task: "Retried task" }]));
+  await fs.writeFile(path.join(storage, "tasks", id, "ui_messages.json"), JSON.stringify([
+    { say: "error", text: "Task failed: transient failure" },
+    { say: "user_feedback", text: "Retry" },
+    { say: "api_req_started" }
+  ]));
+  assert.equal((await getLegacyWorkspaceSessionStatus("/repo", clineRoot, storage))?.status, "running");
+  await fs.rm(root, { recursive: true });
+});
+
+test("new-task handoff detection is exact-workspace and ignores an acknowledged handoff", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-new-task-handoff-")), storage = path.join(root, "storage"), id = "handoff";
+  await fs.mkdir(path.join(storage, "state"), { recursive: true });
+  await fs.mkdir(path.join(storage, "tasks", id), { recursive: true });
+  await fs.writeFile(path.join(storage, "state", "taskHistory.json"), JSON.stringify([{ id, cwdOnTaskInitialization: "/repo", task: "Original task" }]));
+  const messages = path.join(storage, "tasks", id, "ui_messages.json");
+  await fs.writeFile(messages, JSON.stringify([{ ts: 77, type: "ask", ask: "new_task", text: "Handoff context" }]));
+  assert.deepEqual(await getLegacyNewTaskHandoff("/repo", storage), { sessionId: id, marker: `${id}:77`, text: "Handoff context" });
+  assert.equal(await getLegacyNewTaskHandoff("/other", storage), undefined);
+  await fs.writeFile(messages, JSON.stringify([{ ask: "new_task" }, { say: "user_feedback", text: "Finish in this thread. Do not hand off." }]));
+  assert.equal(await getLegacyNewTaskHandoff("/repo", storage), undefined);
+  await fs.rm(root, { recursive: true });
+});
+
 test("queue completion monitor recognizes a completed Cline UI task", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-ui-queue-"));
   const clineRoot = path.join(root, "sessions-root"), storage = path.join(root, "storage"), id = String(Date.now()), prompt = "# Queued task\nBody";
   await fs.mkdir(path.join(storage, "state"), { recursive: true });
   await fs.mkdir(path.join(storage, "tasks", id), { recursive: true });
   await fs.writeFile(path.join(storage, "state", "taskHistory.json"), JSON.stringify([{ id, cwdOnTaskInitialization: "/repo", task: prompt }]));
-  await fs.writeFile(path.join(storage, "tasks", id, "ui_messages.json"), JSON.stringify([{ ts: Date.now(), type: "ask", ask: "completion_result" }]));
+  await fs.writeFile(path.join(storage, "tasks", id, "ui_messages.json"), JSON.stringify([
+    { ts: Date.now() - 1, type: "say", say: "task_progress", text: "- [x] Implement\n- [ ] Validate" },
+    { ts: Date.now(), type: "ask", ask: "completion_result" }
+  ]));
   const result = await waitForLegacyTaskCompletion("/repo", prompt, new Date(Date.now() - 1000).toISOString(), new AbortController().signal, logger, clineRoot, storage, { terminalStabilityMs: 0 });
   assert.equal(result.sessionId, id);
   assert.equal(result.status, "completed");
+  assert.equal(result.taskProgressText, "- [x] Implement\n- [ ] Validate");
   await fs.rm(root, { recursive: true });
 });
 

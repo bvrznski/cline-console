@@ -6,25 +6,28 @@ import { taskTitle } from "../common/task_title";
 import type { Logger } from "../common/logging";
 import type { ClineAdapter } from "../integrations/cline/types";
 import type { QueueStatus } from "../ipc/types";
-import { waitForLegacyMessageCompletion, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle } from "../integrations/cline/completion_monitor";
-import { hasExplicitRemainingWork } from "../integrations/cline/remaining_work";
+import { getLegacyNewTaskHandoff, waitForLegacyMessageCompletion, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle } from "../integrations/cline/completion_monitor";
+import { auditCompletionReport, extractRemainingSteps } from "../integrations/cline/remaining_work";
+import type { HistoryStore } from "../history/history_store";
 
 type QueueState = "queued" | "running" | "completed" | "failed" | "skipped";
-interface QueueItem { id: string; kind?: "task" | "message"; sourcePath: string; prompt: string; targetSessionId?: string; state: QueueState; queuedAt: string; dispatchedAt?: string; finishedAt?: string; sessionId?: string; lastCompletionMarker?: string; lastRecoveryMarker?: string; error?: string; }
-interface QueueFile { version: 1; workspace: string; paused?: boolean; ignoredWaitingTaskIds?: string[]; items: QueueItem[]; }
+interface QueueItem { id: string; kind?: "task" | "message"; sourcePath: string; prompt: string; targetSessionId?: string; resumeSessionId?: string; state: QueueState; queuedAt: string; dispatchedAt?: string; finishedAt?: string; sessionId?: string; lastCompletionMarker?: string; lastRecoveryMarker?: string; lastFailureMarker?: string; lastTestTimeoutMarker?: string; incompleteCompletionClaims?: number; error?: string; }
+interface QueueFile { version: 1; workspace: string; paused?: boolean; ignoredWaitingTaskIds?: string[]; compactedNewTaskMarkers?: string[]; handledNewTaskMarkers?: string[]; items: QueueItem[]; }
 export const TASK_DISPATCH_DELAY_MS = 30_000;
 export const DISPATCH_STABILITY_DELAY_MS = 1_000;
+export const POLICY_MESSAGE_TIMEOUT_MS = 30_000;
 
 export class TaskQueue {
   private data: QueueFile;
   private worker?: Promise<void>;
+  private policyWorker?: Promise<void>;
   private abortController = new AbortController();
 
-  constructor(private readonly file: string, private readonly workspace: string, private readonly adapter: ClineAdapter, private readonly logger: Logger) {
+  constructor(private readonly file: string, private readonly workspace: string, private readonly adapter: ClineAdapter, private readonly logger: Logger, private readonly history?: HistoryStore) {
     this.data = { version: 1, workspace, items: [] };
   }
 
-  async start(): Promise<void> { if (this.abortController.signal.aborted) this.abortController = new AbortController(); await this.load(); this.kick(); }
+  async start(): Promise<void> { if (this.abortController.signal.aborted) this.abortController = new AbortController(); await this.load(); this.recordHistory("startup_reconciliation"); this.kick(); this.startPolicyMonitor(); }
 
   async enqueue(tasks: Array<{ sourcePath: string; prompt: string }>): Promise<{ queued: number; queueLength: number }> {
     return this.append(tasks.map(task => ({ kind: "task" as const, sourcePath: task.sourcePath, prompt: task.prompt })));
@@ -33,7 +36,7 @@ export class TaskQueue {
   async enqueueUnfinished(tasks: Array<{ sourcePath: string; prompt: string }>): Promise<{ queued: number; skippedExisting: number; queueLength: number }> {
     const existingSources = new Set(this.data.items.map(item => item.sourcePath));
     const fresh = tasks.filter(task => !existingSources.has(task.sourcePath));
-    const result = fresh.length ? await this.enqueue(fresh) : { queued: 0, queueLength: this.data.items.filter(item => item.state === "queued" || item.state === "running").length };
+    const result = fresh.length ? await this.append(fresh.map(task => ({ kind: "task" as const, sourcePath: task.sourcePath, prompt: task.prompt, resumeSessionId: task.sourcePath.startsWith("cline-history:") ? task.sourcePath.slice("cline-history:".length) : undefined }))) : { queued: 0, queueLength: this.data.items.filter(item => item.state === "queued" || item.state === "running").length };
     return { ...result, skippedExisting: tasks.length - fresh.length };
   }
 
@@ -59,7 +62,7 @@ export class TaskQueue {
 
   async clear(clearHistory?: (selectors: { prompts: string[]; taskIds: string[] }) => Promise<number>): Promise<{ cleared: number; clearedWaiting: number; clearedStaleRunning: number; queueLength: number; runningPreserved: boolean; historyDeleted: number }> {
     this.abortController.abort();
-    await this.worker;
+    await Promise.all([this.worker, this.policyWorker]);
     this.abortController = new AbortController();
     const clearedWaiting = this.data.items.filter(item => item.state === "queued").length;
     const clearedStaleRunning = this.data.items.filter(item => item.state === "running").length;
@@ -71,10 +74,13 @@ export class TaskQueue {
       throw error;
     }
     this.data.items = [];
+    this.data.compactedNewTaskMarkers = [];
+    this.data.handledNewTaskMarkers = [];
     await this.persist();
     const runningPreserved = false;
     const cleared = clearedWaiting + clearedStaleRunning;
     this.logger.info(`Enforced queue clearance for ${this.workspace}: ${clearedWaiting} waiting, ${clearedStaleRunning} running, ${historyDeleted} Cline history task(s).`);
+    this.startPolicyMonitor();
     return { cleared, clearedWaiting, clearedStaleRunning, queueLength: 0, runningPreserved, historyDeleted };
   }
 
@@ -133,7 +139,7 @@ export class TaskQueue {
     return [...this.data.items].reverse().find(item => item.prompt === prompt)?.sourcePath;
   }
 
-  private async append(items: Array<{ kind: "task" | "message"; sourcePath: string; prompt: string; targetSessionId?: string }>): Promise<{ queued: number; queueLength: number }> {
+  private async append(items: Array<{ kind: "task" | "message"; sourcePath: string; prompt: string; targetSessionId?: string; resumeSessionId?: string }>): Promise<{ queued: number; queueLength: number }> {
     const now = new Date().toISOString();
     const terminal = this.data.items.filter(item => item.state === "completed" || item.state === "failed" || item.state === "skipped").slice(-100);
     const active = this.data.items.filter(item => item.state === "queued" || item.state === "running");
@@ -149,6 +155,41 @@ export class TaskQueue {
       this.worker = undefined;
       if (!this.abortController.signal.aborted && !this.data.paused && this.data.items.some(item => item.state === "queued" || item.state === "running")) this.kick();
     });
+  }
+
+  private startPolicyMonitor(): void {
+    if (!this.policyWorker) this.policyWorker = this.monitorNewTaskHandoffs().finally(() => { this.policyWorker = undefined; });
+  }
+
+  private async monitorNewTaskHandoffs(): Promise<void> {
+    while (!this.abortController.signal.aborted) {
+      try {
+        const handoff = await getLegacyNewTaskHandoff(this.workspace);
+        if (handoff && !(this.data.handledNewTaskMarkers ?? []).includes(handoff.marker)) {
+          if (!(this.data.compactedNewTaskMarkers ?? []).includes(handoff.marker)) {
+            this.recordHistoryEvent({ type: "new_task_handoff_detected", source: "scanner", observed: true, clineSessionId: handoff.sessionId, payload: { marker: handoff.marker, proposedContext: handoff.text } });
+            await withTimeout(this.adapter.sendMessage("/compact"), POLICY_MESSAGE_TIMEOUT_MS, "Timed out requesting Cline compaction.");
+            this.data.compactedNewTaskMarkers = [...(this.data.compactedNewTaskMarkers ?? []).slice(-99), handoff.marker];
+            await this.persist();
+            this.logger.info(`Rejected Cline new-task handoff ${handoff.marker} and requested compaction.`);
+            await abortableDelay(5_000, this.abortController.signal);
+          }
+          await withTimeout(
+            this.adapter.sendMessage("Do not start a new task. Finish all remaining work in this same thread, including implementation, tests, validation, remediation, documentation, and the final task report. Continue until every in-scope completion criterion is satisfied."),
+            POLICY_MESSAGE_TIMEOUT_MS,
+            "Timed out requesting same-thread task completion."
+          );
+          this.data.handledNewTaskMarkers = [...(this.data.handledNewTaskMarkers ?? []).slice(-99), handoff.marker];
+          this.data.compactedNewTaskMarkers = (this.data.compactedNewTaskMarkers ?? []).filter(marker => marker !== handoff.marker);
+          await this.persist();
+          this.recordHistoryEvent({ type: "same_thread_completion_requested", source: "scanner", clineSessionId: handoff.sessionId, payload: { marker: handoff.marker } });
+          this.logger.info(`Requested same-thread completion for Cline task ${handoff.sessionId}.`);
+        }
+      } catch (error) {
+        if (!this.abortController.signal.aborted) this.logger.error(`New-task handoff policy failed and will retry: ${String(error)}`);
+      }
+      await abortableDelay(5_000, this.abortController.signal);
+    }
   }
 
   private async process(): Promise<void> {
@@ -182,8 +223,16 @@ export class TaskQueue {
             await this.adapter.sendMessage(item.prompt);
             this.logger.info(`Dispatched queued message ${item.id} from ${item.sourcePath}.`);
           } else {
-            await this.adapter.newTask(item.prompt);
-            this.logger.info(`Dispatched queued task ${item.id} from ${item.sourcePath}.`);
+            if (item.resumeSessionId) {
+              if (!this.adapter.resumeTask) throw new ClineConsoleError("CLINE_API_UNSUPPORTED", "Native historical resume is unavailable; refusing to start a replacement task.");
+              await this.adapter.resumeTask(item.resumeSessionId);
+              await this.adapter.sendMessage("Complete all unfinished work in this existing task. Validate the full original scope before completing.");
+              item.sessionId = item.resumeSessionId;
+              this.logger.info(`Resumed historical Cline task ${item.resumeSessionId} for queue item ${item.id}.`);
+            } else {
+              await this.adapter.newTask(item.prompt);
+              this.logger.info(`Dispatched queued task ${item.id} from ${item.sourcePath}.`);
+            }
           }
         }
         catch (error) { item.state = "failed"; item.finishedAt = new Date().toISOString(); item.error = error instanceof Error ? error.message : String(error); await this.persist(); continue; }
@@ -195,12 +244,15 @@ export class TaskQueue {
             knownSessionId: item.sessionId,
             afterCompletionMarker: item.lastCompletionMarker,
             afterRecoveryMarker: item.lastRecoveryMarker,
+            afterFailureMarker: item.lastFailureMarker,
+            afterTestTimeoutMarker: item.lastTestTimeoutMarker,
             onSessionObserved: async sessionId => {
               item.sessionId = sessionId;
               await this.persist();
             }
           });
         if (result.sessionId) item.sessionId = result.sessionId;
+        this.recordHistoryEvent({ type: "cline_task_observation", source: "cline", observed: true, taskId: item.id, queueItemId: item.id, clineSessionId: result.sessionId, payload: result });
         if (item.kind !== "message" && result.status === "context_overflow") {
           item.lastRecoveryMarker = result.recoveryMarker;
           await this.persist();
@@ -211,16 +263,43 @@ export class TaskQueue {
           this.logger.info(`Requested continuation after context compaction for Cline task ${result.sessionId}.`);
           continue;
         }
-        if (item.kind !== "message" && result.status === "completed" && hasExplicitRemainingWork(result.completionText)) {
+        if (item.kind !== "message" && result.status === "task_failed") {
+          item.lastFailureMarker = result.failureMarker;
+          item.error = result.errorText;
+          await this.persist();
+          await this.adapter.sendMessage("/compact");
+          this.logger.info(`Requested context compaction after Cline task failure ${result.failureMarker}.`);
+          await waitForLegacyMessageCompletion(this.workspace, result.sessionId, this.abortController.signal, this.logger);
+          await this.adapter.sendMessage("continue");
+          this.logger.info(`Requested continuation after Cline task failure ${result.failureMarker}.`);
+          continue;
+        }
+        if (item.kind !== "message" && result.status === "test_timeout") {
+          item.lastTestTimeoutMarker = result.testTimeoutMarker;
+          item.error = result.errorText;
+          await this.persist();
+          await this.adapter.sendMessage(testTimeoutFollowup(result.timedOutCommand));
+          this.recordHistoryEvent({ type: "unresolved_test_timeout", source: "scanner", taskId: item.id, queueItemId: item.id, clineSessionId: result.sessionId, payload: { marker: result.testTimeoutMarker, command: result.timedOutCommand, error: result.errorText } });
+          this.logger.info(`Completion blocked by unresolved test timeout ${result.testTimeoutMarker}.`);
+          continue;
+        }
+        const completionAudit = item.kind !== "message" && result.status === "completed" ? auditCompletionReport(result.completionText, result.taskProgressText) : undefined;
+        if (completionAudit?.requiresContinuation) {
+          item.incompleteCompletionClaims = (item.incompleteCompletionClaims ?? (item.lastCompletionMarker ? 1 : 0)) + 1;
           item.lastCompletionMarker = result.completionMarker;
           await this.persist();
-          await this.adapter.sendMessage("Complete all remaining work identified in your completion report. Do not stop at a partial implementation; finish and validate every remaining item before completing the task again.");
-          this.logger.info(`Requested completion of explicitly reported remaining work for Cline task ${result.sessionId}.`);
+          const remainingSteps = extractRemainingSteps(result.completionText, result.taskProgressText);
+          const followup = incompleteCompletionFollowup(item.incompleteCompletionClaims, remainingSteps);
+          await this.adapter.sendMessage(followup);
+          if (item.incompleteCompletionClaims > 1) {
+            this.recordHistoryEvent({ type: "repeated_incomplete_completion_claim", source: "scanner", taskId: item.id, queueItemId: item.id, clineSessionId: result.sessionId, payload: { claimCount: item.incompleteCompletionClaims, reason: completionAudit.reason, completionMarker: result.completionMarker, remainingSteps } });
+          }
+          this.logger.info(`Mandatory completion audit retained Cline task ${result.sessionId}: ${completionAudit.reason}.`);
           continue;
         }
         item.finishedAt = new Date().toISOString();
         item.state = result.status === "deleted" ? "skipped" : result.status === "completed" && (result.exitCode === undefined || result.exitCode === 0) ? "completed" : "failed";
-        if (item.state === "failed") item.error = `Cline session ended with ${result.status}${result.exitCode === undefined ? "" : ` (exit ${result.exitCode})`}.`;
+        if (item.state === "failed") item.error = result.errorText ?? `Cline session ended with ${result.status}${result.exitCode === undefined ? "" : ` (exit ${result.exitCode})`}.`;
         await this.persist();
       } catch (error) {
         if (this.abortController.signal.aborted) return;
@@ -241,9 +320,22 @@ export class TaskQueue {
     const temporary = `${this.file}.${process.pid}.tmp`;
     await fs.writeFile(temporary, JSON.stringify(this.data, null, 2), { mode: 0o600 });
     await fs.rename(temporary, this.file);
+    this.recordHistory("queue_persisted");
   }
 
-  async stop(): Promise<void> { this.abortController.abort(); await this.worker; }
+  private recordHistory(reason: string): void {
+    if (!this.history) return;
+    try { this.history.recordQueueSnapshot(this.workspace, this.data.items, reason, { paused: this.data.paused === true, ignoredWaitingTaskIds: this.data.ignoredWaitingTaskIds ?? [], compactedNewTaskMarkers: this.data.compactedNewTaskMarkers ?? [], handledNewTaskMarkers: this.data.handledNewTaskMarkers ?? [] }); }
+    catch (error) { this.logger.error(`Failed to record SQLite history snapshot: ${String(error)}`); }
+  }
+
+  private recordHistoryEvent(event: Parameters<HistoryStore["recordEvent"]>[1]): void {
+    if (!this.history) return;
+    try { this.history.recordEvent(this.workspace, event); }
+    catch (error) { this.logger.error(`Failed to record SQLite history event: ${String(error)}`); }
+  }
+
+  async stop(): Promise<void> { this.abortController.abort(); await Promise.all([this.worker, this.policyWorker]); }
 }
 
 export async function readQueueStatusFile(file: string, workspace: string): Promise<QueueStatus> {
@@ -305,6 +397,18 @@ function firstLine(value: string): string {
   return taskTitle(value) ?? "(untitled)";
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export function remainingTaskDispatchDelay(items: Array<{ kind?: "task" | "message"; state: string; finishedAt?: string }>, now = Date.now(), delayMs = TASK_DISPATCH_DELAY_MS): number {
   const latest = items
     .filter(item => item.kind !== "message" && (item.state === "completed" || item.state === "failed") && item.finishedAt)
@@ -312,6 +416,19 @@ export function remainingTaskDispatchDelay(items: Array<{ kind?: "task" | "messa
     .filter(Number.isFinite)
     .reduce((maximum, value) => Math.max(maximum, value), 0);
   return latest ? Math.max(0, latest + delayMs - now) : 0;
+}
+
+export function incompleteCompletionFollowup(claimCount: number, remainingSteps: string[] = []): string {
+  const exactItems = remainingSteps.length
+    ? `\n\nThe scanner detected these concrete remaining steps:\n${remainingSteps.map((item, index) => `${index + 1}. ${JSON.stringify(item)}`).join("\n")}\n\nResolve each named item directly. If an incomplete item claims it is COMPLETED, resolve the contradiction by verifying the implementation and evidence, then accurately mark it complete or remove the unsupported claim.`
+    : "";
+  if (claimCount <= 1) return `Complete all unfinished work.${exactItems}\n\nReview the original task and your completion report, implement every remaining, pending, deferred, future, incomplete, or unvalidated item, and do not complete again until the entire requested scope is finished and validated.`;
+  return `STOP: you have repeatedly claimed completion while the completion audit still finds incomplete steps. Stay in this same task and do not provide another completion summary yet.${exactItems}\n\nRe-read the complete original task prompt. Rebuild task_progress from the full original scope rather than the shortened checklist: create a stage-by-stage requirements matrix covering every original implementation, architecture, integration, security, persistence, concurrency, serialization, observability, validation, audit/remediation, documentation, and completion criterion. For every requirement, record PASS with concrete file or command evidence, or implement and validate the missing work. Do not call attempt_completion while any checkbox is unchecked, any requirement lacks evidence, or any requested validation remains unrun without an explicit justified blocker.`;
+}
+
+export function testTimeoutFollowup(command?: string): string {
+  const exactCommand = command ? `\n\nTimed-out test command:\n${JSON.stringify(command)}` : "";
+  return `Do not complete the task: a test command timed out and the timeout is unresolved.${exactCommand}\n\nDiagnose whether the hang is in the production code, test fixture, teardown, background worker, async task, subprocess, or test runner. Improve the tests so every potentially blocking operation has a justified bounded timeout and cleanup path, and add or strengthen a regression test that reproduces the hang without leaving processes or threads behind. Then rerun the timed-out test scope (not merely a narrower substitute) and provide explicit passing output. If the original scope is inherently long-running, use an explicit justified outer timeout and progress evidence; do not reinterpret a timeout as a pass.`;
 }
 
 function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {

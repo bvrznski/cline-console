@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { hasExplicitRemainingWork } from "./remaining_work";
 
 export interface DeletedTaskHistory { deleted: number; taskIds: string[]; }
 export interface UnfinishedTaskHistory { sessionId: string; prompt: string; sourcePath: string; }
@@ -16,7 +17,15 @@ export async function getLegacyUnfinishedWorkspaceTasks(workspace: string, vscod
     if (entry.cwdOnTaskInitialization !== workspace || typeof entry.id !== "string" || typeof entry.task !== "string" || !entry.task.length) continue;
     try {
       const messages = JSON.parse(await fs.readFile(path.join(storage, "tasks", entry.id, "ui_messages.json"), "utf8")) as Array<Record<string, unknown>>;
-      if (messages.at(-1)?.ask === "resume_task") unfinished.push({ sessionId: entry.id, prompt: entry.task, sourcePath: `cline-history:${entry.id}` });
+      const completionText = [...messages].reverse().find(message =>
+        (message.ask === "completion_result" || message.say === "completion_result") && typeof message.text === "string"
+      )?.text;
+      const taskProgressText = [...messages].reverse().find(message =>
+        (message.ask === "task_progress" || message.say === "task_progress") && typeof message.text === "string"
+      )?.text;
+      if (hasExplicitRemainingWork(typeof completionText === "string" ? completionText : undefined, typeof taskProgressText === "string" ? taskProgressText : undefined)) {
+        unfinished.push({ sessionId: entry.id, prompt: entry.task, sourcePath: `cline-history:${entry.id}` });
+      }
     } catch { /* Missing or transient task data is not safe to classify as unfinished. */ }
   }
   return unfinished;

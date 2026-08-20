@@ -8,14 +8,15 @@ import type { IpcRequest, IpcResponse, WorkspaceRegistration } from "../ipc/type
 import type { ClineAdapter } from "../integrations/cline/types";
 import type { TaskQueue } from "./task_queue";
 import { getLatestLegacyWorkspaceTaskPrompt, getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, reconcileLegacyStatus } from "../integrations/cline/completion_monitor";
-import { deleteLegacyQueuedTaskHistory, deleteLegacyWorkspaceTaskHistory, getLegacyUnfinishedWorkspaceTasks } from "../integrations/cline/task_history";
+import { deleteLegacyQueuedTaskHistory, getLegacyUnfinishedWorkspaceTasks } from "../integrations/cline/task_history";
 import { ensureRuntimeDirectory, registerWorkspace, socketPath, unregisterWorkspace, workspaceId } from "./workspace_registry";
+import type { HistoryStore } from "../history/history_store";
 
 export class IpcServer {
   private server?: net.Server;
   private registration?: WorkspaceRegistration;
 
-  constructor(private readonly directory: string, private readonly workspace: string, private readonly adapter: ClineAdapter, private readonly logger: Logger, private readonly queue?: TaskQueue) {}
+  constructor(private readonly directory: string, private readonly workspace: string, private readonly adapter: ClineAdapter, private readonly logger: Logger, private readonly queue?: TaskQueue, private readonly history?: HistoryStore) {}
 
   async start(): Promise<WorkspaceRegistration> {
     if (this.server && this.registration) return this.registration;
@@ -72,14 +73,29 @@ export class IpcServer {
       const requested = await fs.realpath(path.resolve(request.workspace));
       if (requested !== expected) throw new ClineConsoleError("WORKSPACE_MISMATCH", "Request workspace does not match this VS Code window.");
       this.logger.info(`Received ${request.action} request ${request.requestId}.`);
+      this.recordHistory(() => this.history!.recordEvent(expected, { type: "ipc_request", source: "cli", payload: { requestId: request.requestId, action: request.action, payload: request.payload ?? null } }));
       let result: unknown;
       switch (request.action) {
-        case "newTask": result = await this.adapter.newTask(requiredText(request.payload?.prompt, "prompt")); break;
+        case "newTask": {
+          const prompt = requiredText(request.payload?.prompt, "prompt");
+          result = await this.adapter.newTask(prompt);
+          const clineSessionId = (result as { taskId?: string }).taskId;
+          this.recordHistory(() => this.history!.recordTask(expected, clineSessionId ?? request.requestId, prompt, "<inline-or-stdin>", "task", { requestId: request.requestId, clineSessionId }));
+          break;
+        }
         case "reloadTask": {
           const latest = await getLatestLegacyWorkspaceTaskPrompt(expected);
           if (!latest) throw new ClineConsoleError("TASK_NOT_FOUND", "No previous Cline task was found for this workspace.");
           await this.adapter.newTask(latest.prompt);
           result = { taskReloaded: true, previousTaskId: latest.sessionId };
+          break;
+        }
+        case "resumeHistoryTask": {
+          const sessionId = requiredText(request.payload?.sessionId, "sessionId");
+          if (!this.adapter.resumeTask) throw new ClineConsoleError("CLINE_API_UNSUPPORTED", "Native historical resume is unavailable.");
+          await this.adapter.resumeTask(sessionId);
+          await this.adapter.sendMessage("Complete all unfinished work in this existing task. Validate the full original scope before completing.");
+          result = { taskResumed: true, sessionId };
           break;
         }
         case "finishUnfinishedTasks": {
@@ -136,20 +152,17 @@ export class IpcServer {
         }
         case "clearQueue": {
           if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
-          result = await this.queue.clear(async selectors => {
+          const clearHistory = request.payload?.force === true ? async (selectors: { prompts: string[]; taskIds: string[] }) => {
             const latest = await getLatestLegacyWorkspaceTaskPrompt(expected);
             if (latest && (selectors.taskIds.includes(latest.sessionId) || selectors.prompts.includes(latest.prompt))) await this.adapter.cancelTask();
             return (await deleteLegacyQueuedTaskHistory(expected, selectors.prompts, selectors.taskIds)).deleted;
-          });
+          } : undefined;
+          result = await this.queue.clear(clearHistory);
           break;
         }
         case "clearWorkspace": {
           if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
-          result = await this.queue.clear(async () => {
-            const latest = await getLatestLegacyWorkspaceTaskPrompt(expected);
-            if (latest) await this.adapter.cancelTask();
-            return (await deleteLegacyWorkspaceTaskHistory(expected)).deleted;
-          });
+          result = await this.queue.clear();
           break;
         }
         case "popQueue": {
@@ -174,11 +187,19 @@ export class IpcServer {
         }
         case "activity": result = await getLegacyWorkspaceActivity(expected); break;
       }
+      this.recordHistory(() => this.history!.recordEvent(expected, { type: "ipc_response", source: "cline-console", payload: { requestId: request.requestId, action: request.action, result: result ?? null } }));
       this.write(socket, { protocolVersion: 1, requestId: request.requestId, ok: true, result });
-    } catch (error) { this.writeError(socket, request.requestId, error); }
+    } catch (error) {
+      this.recordHistory(() => this.history!.recordEvent(this.workspace, { type: "ipc_error", source: "cline-console", payload: { requestId: request.requestId, action: request.action, error: errorMessage(error) } }));
+      this.writeError(socket, request.requestId, error);
+    }
   }
 
   private write(socket: net.Socket, response: IpcResponse): void { socket.end(serializeResponse(response)); }
+  private recordHistory(operation: () => void): void {
+    if (!this.history) return;
+    try { operation(); } catch (error) { this.logger.error(`Failed to record SQLite history event: ${errorMessage(error)}`); }
+  }
   private writeError(socket: net.Socket, requestId: string, error: unknown): void {
     const code = error instanceof ClineConsoleError ? error.code : "INTERNAL_ERROR";
     this.logger.error(`${code}: ${errorMessage(error)}`);

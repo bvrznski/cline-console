@@ -54,11 +54,13 @@ workspaces unless scoped. `task stop` uses Cline's normal cancellation path.
 `task restart` restarts the latest exact-workspace history item from its original
 full prompt.
 
-`tasks finish` discovers exact-workspace history entries ending in
-`resume_task`, appends their original prompts to the queue oldest-first, and
-deduplicates entries already retained by that queue. Because Cline Legacy does
-not expose the native History resume action, these tasks are re-run through the
-normal queue.
+`tasks finish` discovers exact-workspace history entries whose latest readable
+completion explicitly declares remaining work or whose latest Cline task
+progress is incomplete, appends their original prompts
+to the queue oldest-first, and
+deduplicates entries already retained by that queue. Historical entries retain
+their Cline session IDs and require native `showTaskWithId` support. If it is
+unavailable, dispatch fails safely instead of starting a replacement task.
 
 ## Queue commands
 
@@ -74,6 +76,7 @@ cline-console -w /repo queue list --json
 cline-console -w /repo queue pause
 cline-console -w /repo queue resume
 cline-console -w /repo queue clear
+cline-console -w /repo queue clear --force
 cline-console -w /repo queue remove --file /tasks/one.md
 cline-console -w /repo queue remove --title "Displayed title"
 cline-console -w /repo queue remove --id UUID
@@ -102,7 +105,7 @@ connected. Each workspace also summarizes retained completed and
 failed history counts. Human-readable output aligns columns to their widest
 visible values and separates headers from entries with a horizontal rule.
 
-Queued tasks require a terminal status to remain stable for at least 60 seconds
+Queued tasks require a terminal status to remain stable for at least 30 seconds
 before completion is recorded. Resumed activity resets that timer. They then
 have a 30-second dispatch cooldown after the preceding queued task completes or
 fails. The persisted cooldown survives extension reloads. Messages
@@ -115,22 +118,36 @@ immediately.
 `pause` persists a stop-after-current-item boundary: the running item is
 preserved, but no waiting item dispatches afterward. `resume` clears that pause
 and kicks queue processing when persisted items remain. `clear` enforces removal
-of all running and waiting entries; exact workspace/full-prompt or recorded-ID matches are also
-deleted from Cline history, while unrelated tasks remain. `queue remove` removes exactly one waiting
+of all running and waiting queue entries without modifying Cline history. Only
+`clear --force` also cancels an exact active queue match and deletes exact
+workspace/full-prompt or recorded-ID matches from Cline history. `queue remove` removes exactly one waiting
 entry with an explicit file, title, or ID selector. Ambiguous titles are
 rejected.
 
 ## Workspace and service commands
 
 `workspace list` displays registered VS Code workspaces. `workspace clear`
-requires `--workspace` and removes the selected workspace's entire queue plus
-all exact-workspace Cline history and per-task storage. Other workspaces are
-preserved.
+requires `--workspace` and removes the selected workspace's cline-console queue
+state without altering Cline history.
 
 ```bash
 cline-console workspace list
 cline-console service install|start|stop|restart|status
 ```
+
+## History commands
+
+```bash
+cline-console history path
+cline-console history list [--limit NUMBER]
+cline-console -w /repo history list [--limit NUMBER]
+cline-console history show TASK_ID
+```
+
+`history list` displays durable task identities without full prompt bodies.
+`history show` returns the complete stored record, including its immutable
+initial prompt, runs, and events. The SQLite database is separate from Cline's
+history and is not erased by queue clearance.
 
 ## Compatibility aliases
 

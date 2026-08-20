@@ -79,11 +79,11 @@ Restart the latest exact-workspace task using its original full prompt from
 Cline history.
 .TP
 .B tasks finish
-Queue every exact-workspace Cline history item ending in
-.B resume_task
-for completion, oldest first. Already retained queue-history entries are
-deduplicated. Cline Legacy does not expose native historical resume, so prompts
-are re-run through the normal queue.
+Queue every exact-workspace Cline history item whose latest readable completion
+explicitly declares remaining work or whose latest task-progress count is incomplete,
+oldest first. Already retained queue-history entries are
+deduplicated. Historical recovery requires a compatible native showTaskWithId
+API. If unavailable, dispatch fails safely and never starts a replacement task.
 .TP
 .B task capabilities
 Display the detected Cline version and supported adapter operations.
@@ -134,13 +134,16 @@ The pause is persisted.
 .B queue resume
 Clear the persisted pause and resume FIFO processing.
 .TP
-.B queue clear
-Remove all waiting and running queue entries. Cancel an active task only when it
-exactly matches this queue, then delete matching task IDs from Cline history and
-per-task storage. Tasks from other workspaces and unrelated manual tasks are
-preserved.
+.B queue clear [--force]
+Remove all waiting and running queue entries without changing Cline history.
+With
+.BR --force ,
+cancel an active task only when it exactly matches this queue, then delete
+matching task IDs from Cline history and per-task storage. This is the only
+command that removes tasks from Cline history. Tasks from other workspaces and
+unrelated manual tasks are preserved.
 .PP
-Queued tasks must remain terminal for at least 60 seconds before completion is
+Queued tasks must remain terminal for at least 30 seconds before completion is
 recorded. If execution resumes, that confirmation timer resets. The next task
 then waits 30 seconds after the confirmed completion or failure.
 Workspace activity, pause, clear, replacement, and removal state are rechecked
@@ -151,9 +154,8 @@ before dispatch. Queued follow-up messages are not delayed.
 List registered VS Code filesystem workspaces and their local endpoints.
 .TP
 .B workspace clear
-Require an explicit workspace, clear its entire queue, cancel its displayed
-Cline task, and delete all Cline history and per-task storage owned by that
-exact workspace. Other workspaces are preserved.
+Require an explicit workspace and clear its cline-console queue state without
+changing Cline history.
 .SH SERVICE COMMANDS
 .TP
 .B service install
@@ -161,7 +163,6 @@ Install, enable, and start the singleton systemd user service.
 .TP
 .B service start
 Start the user service.
-.TP
 .B service stop
 Stop the user service.
 .TP
@@ -173,6 +174,19 @@ Report whether the service and local socket are available.
 .TP
 .B service run
 Run the singleton routing service in the foreground.
+.SH HISTORY COMMANDS
+.TP
+.B history path
+Print the private SQLite history database path.
+.TP
+.B history list [--limit NUMBER]
+List durable task records, optionally scoped with
+.BR --workspace .
+Full prompt bodies are not printed.
+.TP
+.B history show TASK_ID
+Print the complete task record as JSON, including the stored initial prompt,
+runs, and events.
 .SH INTERACTIVE BEHAVIOR
 Starting a task while another task is active prompts to queue, interrupt and
 replace, or abort. Adding files while a task is incomplete and waiting prompts

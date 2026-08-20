@@ -7,6 +7,7 @@ import type { ClineAdapter, ClineCapabilities, ClineStatus, TaskResult } from ".
 
 interface LegacyPublicApi {
   startNewTask(prompt: string, images?: string[]): Promise<void>;
+  showTaskWithId?(taskId: string): Promise<void>;
   sendMessage(message: string, images?: string[]): Promise<void>;
   pressPrimaryButton?(): Promise<void>;
   pressSecondaryButton?(): Promise<void>;
@@ -57,6 +58,16 @@ export class LegacyCline416Adapter implements ClineAdapter {
     await api.startNewTask(prompt);
     this.task = "active"; this.lastState = "submitted"; this.observedAt = new Date().toISOString();
     return { taskStarted: true };
+  }
+
+  async resumeTask(taskId: string): Promise<TaskResult> {
+    if (!taskId.length) throw new ClineConsoleError("TASK_NOT_FOUND", "Historical task ID is required.");
+    const api = await this.activate();
+    if (!api.showTaskWithId) throw new ClineConsoleError("CLINE_API_UNSUPPORTED", "Cline does not expose native historical task resume. Refusing to start a replacement task.");
+    await this.revealSidebar();
+    await api.showTaskWithId(taskId);
+    this.task = "active"; this.lastState = "waiting"; this.observedAt = new Date().toISOString();
+    return { taskStarted: true, taskId };
   }
 
   private async revealSidebar(): Promise<void> {
