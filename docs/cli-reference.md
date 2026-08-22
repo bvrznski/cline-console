@@ -105,12 +105,18 @@ connected. Each workspace also summarizes retained completed and
 failed history counts. Human-readable output aligns columns to their widest
 visible values and separates headers from entries with a horizontal rule.
 
-Queued tasks require a terminal status to remain stable for at least 30 seconds
+Queued tasks require a terminal status to remain stable for at least 15 seconds
 before completion is recorded. Resumed activity resets that timer. They then
-have a 30-second dispatch cooldown after the preceding queued task completes or
+have a 15-second dispatch cooldown after the preceding queued task completes or
 fails. The persisted cooldown survives extension reloads. Messages
 are delivered without this task-to-task delay. Workspace activity is rechecked
 after an idle stabilization interval and after cooldown before dispatch.
+
+The task scanner is configured globally through VS Code User Settings under
+`cline-console.taskScanner.*`. Its default policies detect incomplete completion
+reports and unresolved test timeouts, implement concrete audit recommendations
+in the same task, and require a post-remediation report. See the README settings
+table for every key and default.
 If the running queue item disappears from Cline's exact-workspace task history,
 the item is retained as skipped and the next matching FIFO item advances
 immediately.

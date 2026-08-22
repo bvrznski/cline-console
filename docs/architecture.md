@@ -54,7 +54,8 @@ metadata only and deliberately omit task bodies.
 5. Only the exact task's Cline UI history can authorize queue advancement;
    auxiliary session metadata is never accepted as terminal while that history
    is available. A `resume_task` marker remains incomplete. `completion_result`
-   starts a 60-second confirmation window and marks completion only if the task
+   starts a 30-second advancement window (15 seconds of terminal stability plus
+   a separate 15-second cooldown) and marks completion only if the task
    remains terminal throughout that window; resumed execution resets the timer.
    Historical recovery items carry their original Cline session ID and dispatch
    only through native history activation; they never fall back to
@@ -62,6 +63,11 @@ metadata only and deliberately omit task bodies.
    pass through a mandatory audit. An incomplete progress count such as `4/13`, or structured
    remaining, outstanding, pending, future, deferred, open, incomplete, or
    partial-work declarations cause a continuation instruction to the same task.
+   Audit-like tasks with concrete recommendation sections are likewise retained:
+   recommendations not previously handled by that queue item are sent to the
+   same task for implementation and, by default, a durable post-remediation
+   report. Normalized recommendation keys prevent identical lists from causing
+   an endless completion loop.
    Missing or truncated bodies are ambiguous and do not independently classify
    a task as incomplete. The queue item remains active until a later completion
    report contains no explicit unfinished-work declaration.

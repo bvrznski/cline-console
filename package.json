@@ -89,6 +89,50 @@
         "cline-console.socketDirectory": {
           "type": "string",
           "default": ""
+        },
+        "cline-console.taskScanner.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Enable completion scanning and same-task continuation policies for all workspaces."
+        },
+        "cline-console.taskScanner.terminalStabilitySeconds": {
+          "type": "number",
+          "minimum": 0,
+          "default": 15,
+          "scope": "application",
+          "description": "Seconds a Cline completion must remain terminal before the scanner evaluates it."
+        },
+        "cline-console.taskScanner.interTaskDelaySeconds": {
+          "type": "number",
+          "minimum": 0,
+          "default": 15,
+          "scope": "application",
+          "description": "Seconds to wait after a completed queue task before dispatching the next task."
+        },
+        "cline-console.taskScanner.detectIncompleteCompletions": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Keep a task active when its completion report or task progress declares unfinished work."
+        },
+        "cline-console.taskScanner.detectTestTimeouts": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Keep a task active when a recognized test command timed out without a successful same-scope rerun."
+        },
+        "cline-console.taskScanner.implementAuditRecommendations": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "For audit tasks, request implementation of concrete recommendations in the same task before completion."
+        },
+        "cline-console.taskScanner.requirePostImplementationReport": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Require audit remediation to produce a durable post-remediation report with validation and residual risk."
         }
       }
     }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { auditCompletionReport, auditTaskProgress, extractRemainingSteps, hasExplicitRemainingWork } from "../src/integrations/cline/remaining_work";
+import { auditCompletionReport, auditTaskProgress, extractAuditRecommendations, extractRemainingSteps, hasExplicitRemainingWork } from "../src/integrations/cline/remaining_work";
 
 test("remaining-work detector recognizes explicit unfinished sections", () => {
   assert.equal(hasExplicitRemainingWork("## Remaining work\n- Add integration tests\n- Update docs"), true);
@@ -40,4 +40,12 @@ test("remaining-work parser extracts concrete steps from progress and completion
   ), ["Fix serialization", "Add integration tests", "Validate runtime startup"]);
   assert.deepEqual(extractRemainingSteps("Remaining tasks: validate the runtime"), ["validate the runtime"]);
   assert.deepEqual(extractRemainingSteps("All work complete", "7/14 complete"), ["Identify and complete the 7 steps still missing from task_progress (7/14 complete)"]);
+});
+
+test("audit recommendation parser extracts actionable lists only for audit tasks", () => {
+  const report = "## Recommended Next Actions\n1. Restrict SSH access\n2. Add regression tests\n\n## Evidence\nCollected locally";
+  assert.deepEqual(extractAuditRecommendations("Perform a security audit", report), ["Restrict SSH access", "Add regression tests"]);
+  assert.deepEqual(extractAuditRecommendations("Implement a feature", report), []);
+  assert.deepEqual(extractAuditRecommendations("Perform a code review", "## Recommendations\nNone"), []);
+  assert.deepEqual(extractAuditRecommendations("Run an assessment", "Recommendations: rotate credentials"), ["rotate credentials"]);
 });

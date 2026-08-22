@@ -6,7 +6,7 @@ import { registerCommands } from "./commands";
 import { IpcServer } from "./server";
 import { runtimeDirectory } from "./workspace_registry";
 import { workspaceId } from "./workspace_registry";
-import { TaskQueue } from "./task_queue";
+import { DEFAULT_TASK_SCANNER_OPTIONS, TaskQueue, type TaskScannerOptions } from "./task_queue";
 import { HistoryStore } from "../history/history_store";
 
 let activeServer: IpcServer | undefined;
@@ -35,7 +35,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     activeHistory.registerWorkspace(workspace, { vscodeVersion: vscode.version, extensionVersion: context.extension.packageJSON.version, nodeVersion: process.version, platform: process.platform, architecture: process.arch });
     activeHistory.recordPromptSnapshot(workspace, "system_prompt", undefined, "cline-runtime-private", await adapter.getVersion(), undefined, { availability: "not_exposed_by_public_api", clineConsolePolicy: "capture_full_content_when_observable" });
   } catch (error) { logger.error(`SQLite history is unavailable; queue compatibility storage remains active: ${String(error)}`); activeHistory = undefined; }
-  activeQueue = new TaskQueue(`${directory}/queue-${workspaceId(workspace)}.json`, workspace, adapter, logger, activeHistory);
+  const seconds = (key: string, fallback: number): number => {
+    const value = config.get<number>(key, fallback);
+    return Number.isFinite(value) ? Math.max(0, value) : fallback;
+  };
+  const scanner: TaskScannerOptions = {
+    enabled: config.get<boolean>("taskScanner.enabled", DEFAULT_TASK_SCANNER_OPTIONS.enabled),
+    terminalStabilityMs: seconds("taskScanner.terminalStabilitySeconds", 15) * 1_000,
+    interTaskDelayMs: seconds("taskScanner.interTaskDelaySeconds", 15) * 1_000,
+    detectIncompleteCompletions: config.get<boolean>("taskScanner.detectIncompleteCompletions", DEFAULT_TASK_SCANNER_OPTIONS.detectIncompleteCompletions),
+    detectTestTimeouts: config.get<boolean>("taskScanner.detectTestTimeouts", DEFAULT_TASK_SCANNER_OPTIONS.detectTestTimeouts),
+    implementAuditRecommendations: config.get<boolean>("taskScanner.implementAuditRecommendations", DEFAULT_TASK_SCANNER_OPTIONS.implementAuditRecommendations),
+    requirePostImplementationReport: config.get<boolean>("taskScanner.requirePostImplementationReport", DEFAULT_TASK_SCANNER_OPTIONS.requirePostImplementationReport)
+  };
+  activeQueue = new TaskQueue(`${directory}/queue-${workspaceId(workspace)}.json`, workspace, adapter, logger, activeHistory, scanner);
   await activeQueue.start();
   activeServer = new IpcServer(directory, workspace, adapter, logger, activeQueue, activeHistory);
   const start = async (): Promise<void> => { if (config.get<boolean>("enabled", true)) await activeServer!.start(); };

@@ -2,6 +2,8 @@ const UNFINISHED_LABEL = /^(?:remaining\b.*|outstanding\b.*|pending\b.*|future w
 const INCOMPLETE_STATUS = /^(?:final |completion )?status\s*:\s*(?:partial(?:ly complete)?|incomplete|blocked|not complete|requires? (?:work|completion))\b/i;
 const INCOMPLETE_CERTIFICATION = /\b(?:capability|implementation|migration|task|phase)\s+(?:is\s+)?(?:partial|incomplete|blocked)\s*$/i;
 const EMPTY_REMAINDER = /^(?:none|nothing|n\/?a|not applicable|no(?:ne)? remaining(?: work| tasks?| items?| stages?| steps?)?|complete(?:d)?|all (?:done|complete(?:d)?))\.?$/i;
+const AUDIT_TASK = /\b(?:audit|auditing|assessment|inspection|compliance review|security review|code review)\b/i;
+const RECOMMENDATION_LABEL = /^(?:recommended (?:next )?actions?|recommendations?|remediation(?: recommendations?| actions?)?|proposed (?:improvements?|actions?|remediations?))$/i;
 
 export interface CompletionAudit { requiresContinuation: boolean; reason: string; }
 
@@ -74,6 +76,23 @@ export function extractRemainingSteps(completionText?: string, taskProgressText?
   return steps.slice(0, 50);
 }
 
+export function extractAuditRecommendations(taskPrompt: string | undefined, completionText: string | undefined): string[] {
+  if (!completionText?.trim() || !AUDIT_TASK.test(`${taskPrompt ?? ""}\n${completionText}`)) return [];
+  const recommendations: string[] = [];
+  const lines = completionText.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const parsed = parseRecommendationHeading(lines[index]);
+    if (!parsed) continue;
+    if (isWorkContent(parsed.inline)) addStep(recommendations, parsed.inline);
+    for (index += 1; index < lines.length; index += 1) {
+      if (isSectionHeading(lines[index])) { index -= 1; break; }
+      const item = cleanWorkItem(lines[index]);
+      if (item && isWorkContent(item)) addStep(recommendations, item);
+    }
+  }
+  return recommendations.slice(0, 50);
+}
+
 function parseUnfinishedHeading(line: string): { inline: string } | undefined {
   const trimmed = line.trim();
   const markdownHeading = /^#{1,6}\s+/.test(trimmed);
@@ -82,6 +101,17 @@ function parseUnfinishedHeading(line: string): { inline: string } | undefined {
   const colon = normalized.indexOf(":");
   const label = (colon >= 0 ? normalized.slice(0, colon) : normalized).replace(/\s*\([^)]*\)\s*$/, "").trim();
   if (!(markdownHeading || boldHeading || colon >= 0) || !UNFINISHED_LABEL.test(label)) return undefined;
+  return { inline: colon >= 0 ? normalized.slice(colon + 1).trim() : "" };
+}
+
+function parseRecommendationHeading(line: string): { inline: string } | undefined {
+  const trimmed = line.trim();
+  const markdownHeading = /^#{1,6}\s+/.test(trimmed);
+  const boldHeading = /^(?:\*\*|__).+(?:\*\*|__):?$/.test(trimmed);
+  const normalized = trimmed.replace(/^#{1,6}\s*/, "").replace(/\*\*|__/g, "").trim();
+  const colon = normalized.indexOf(":");
+  const label = (colon >= 0 ? normalized.slice(0, colon) : normalized).trim();
+  if (!(markdownHeading || boldHeading || colon >= 0) || !RECOMMENDATION_LABEL.test(label)) return undefined;
   return { inline: colon >= 0 ? normalized.slice(colon + 1).trim() : "" };
 }
 

@@ -70,7 +70,7 @@ cline-console --workspace /repo queue resume
 ```
 
 Normal task-to-task queue advancement first confirms terminal state for at
-least 30 seconds, then includes a 30-second cooldown. During
+least 15 seconds, then includes a 15-second cooldown. During
 that interval, `queue pause`, `queue clear`, and queue replacement remain
 effective before the next dispatch.
 

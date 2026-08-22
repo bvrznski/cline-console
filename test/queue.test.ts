@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { formatQueue, formatQueues } from "../src/client/commands/queue";
-import { discoverPersistedQueueStatuses, incompleteCompletionFollowup, readQueueStatusFile, remainingTaskDispatchDelay, TaskQueue, testTimeoutFollowup } from "../src/extension/task_queue";
+import { auditRecommendationFollowup, discoverPersistedQueueStatuses, incompleteCompletionFollowup, readQueueStatusFile, remainingTaskDispatchDelay, selectUnhandledAuditRecommendations, TaskQueue, testTimeoutFollowup } from "../src/extension/task_queue";
 import type { ClineAdapter } from "../src/integrations/cline/types";
 import type { Logger } from "../src/common/logging";
 import { deleteLegacyQueuedTaskHistory, deleteLegacyWorkspaceTaskHistory, getLegacyUnfinishedWorkspaceTasks } from "../src/integrations/cline/task_history";
@@ -33,6 +33,17 @@ test("test timeout follow-up requires bounded regression coverage and a full rer
   assert.match(followup, /do not reinterpret a timeout as a pass/i);
 });
 
+test("audit recommendation follow-up requires implementation and a post-remediation report", () => {
+  const followup = auditRecommendationFollowup(["Restrict SSH access", "Add regression tests"]);
+  assert.match(followup, /same task/);
+  assert.match(followup, /1\. "Restrict SSH access"/);
+  assert.match(followup, /2\. "Add regression tests"/);
+  assert.match(followup, /post-remediation report/);
+  assert.match(followup, /residual risk/);
+  assert.doesNotMatch(auditRecommendationFollowup(["Fix it"], false), /post-remediation report/);
+  assert.deepEqual(selectUnhandledAuditRecommendations(["Restrict SSH access", "Add tests"], ["restrict ssh access"]), ["Add tests"]);
+});
+
 function adapterWithStatus(task: "active" | "none", state: "running" | "unknown"): ClineAdapter {
   return {
     newTask: async () => ({ taskStarted: true }), sendMessage: async () => {}, cancelTask: async () => {}, detect: async () => true,
@@ -55,9 +66,9 @@ test("queue formatter displays active items without prompt bodies", () => {
   assert.match(output, /2\s+message\s+queued\s+Run tests/);
 });
 
-test("queued tasks wait 30 seconds after the previous task finishes", () => {
-  const now = Date.parse("2026-08-10T12:00:20.000Z");
-  assert.equal(remainingTaskDispatchDelay([{ kind: "task", state: "completed", finishedAt: "2026-08-10T12:00:00.000Z" }], now), 10_000);
+test("queued tasks wait 15 seconds after the previous task finishes", () => {
+  const now = Date.parse("2026-08-10T12:00:10.000Z");
+  assert.equal(remainingTaskDispatchDelay([{ kind: "task", state: "completed", finishedAt: "2026-08-10T12:00:00.000Z" }], now), 5_000);
   assert.equal(remainingTaskDispatchDelay([{ kind: "task", state: "failed", finishedAt: "2026-08-10T11:59:40.000Z" }], now), 0);
   assert.equal(remainingTaskDispatchDelay([{ kind: "message", state: "completed", finishedAt: "2026-08-10T12:00:19.000Z" }], now), 0);
   assert.equal(remainingTaskDispatchDelay([{ kind: "task", state: "skipped", finishedAt: "2026-08-10T12:00:19.000Z" }], now), 0);

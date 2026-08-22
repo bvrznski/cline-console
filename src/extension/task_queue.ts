@@ -7,15 +7,35 @@ import type { Logger } from "../common/logging";
 import type { ClineAdapter } from "../integrations/cline/types";
 import type { QueueStatus } from "../ipc/types";
 import { getLegacyNewTaskHandoff, waitForLegacyMessageCompletion, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle } from "../integrations/cline/completion_monitor";
-import { auditCompletionReport, extractRemainingSteps } from "../integrations/cline/remaining_work";
+import { auditCompletionReport, extractAuditRecommendations, extractRemainingSteps } from "../integrations/cline/remaining_work";
 import type { HistoryStore } from "../history/history_store";
 
 type QueueState = "queued" | "running" | "completed" | "failed" | "skipped";
-interface QueueItem { id: string; kind?: "task" | "message"; sourcePath: string; prompt: string; targetSessionId?: string; resumeSessionId?: string; state: QueueState; queuedAt: string; dispatchedAt?: string; finishedAt?: string; sessionId?: string; lastCompletionMarker?: string; lastRecoveryMarker?: string; lastFailureMarker?: string; lastTestTimeoutMarker?: string; incompleteCompletionClaims?: number; error?: string; }
+interface QueueItem { id: string; kind?: "task" | "message"; sourcePath: string; prompt: string; targetSessionId?: string; resumeSessionId?: string; state: QueueState; queuedAt: string; dispatchedAt?: string; finishedAt?: string; sessionId?: string; lastCompletionMarker?: string; lastRecoveryMarker?: string; lastFailureMarker?: string; lastTestTimeoutMarker?: string; incompleteCompletionClaims?: number; handledAuditRecommendationKeys?: string[]; error?: string; }
 interface QueueFile { version: 1; workspace: string; paused?: boolean; ignoredWaitingTaskIds?: string[]; compactedNewTaskMarkers?: string[]; handledNewTaskMarkers?: string[]; items: QueueItem[]; }
-export const TASK_DISPATCH_DELAY_MS = 30_000;
+export const TASK_DISPATCH_DELAY_MS = 15_000;
 export const DISPATCH_STABILITY_DELAY_MS = 1_000;
 export const POLICY_MESSAGE_TIMEOUT_MS = 30_000;
+
+export interface TaskScannerOptions {
+  enabled: boolean;
+  terminalStabilityMs: number;
+  interTaskDelayMs: number;
+  detectIncompleteCompletions: boolean;
+  detectTestTimeouts: boolean;
+  implementAuditRecommendations: boolean;
+  requirePostImplementationReport: boolean;
+}
+
+export const DEFAULT_TASK_SCANNER_OPTIONS: TaskScannerOptions = {
+  enabled: true,
+  terminalStabilityMs: 15_000,
+  interTaskDelayMs: 15_000,
+  detectIncompleteCompletions: true,
+  detectTestTimeouts: true,
+  implementAuditRecommendations: true,
+  requirePostImplementationReport: true
+};
 
 export class TaskQueue {
   private data: QueueFile;
@@ -23,7 +43,7 @@ export class TaskQueue {
   private policyWorker?: Promise<void>;
   private abortController = new AbortController();
 
-  constructor(private readonly file: string, private readonly workspace: string, private readonly adapter: ClineAdapter, private readonly logger: Logger, private readonly history?: HistoryStore) {
+  constructor(private readonly file: string, private readonly workspace: string, private readonly adapter: ClineAdapter, private readonly logger: Logger, private readonly history?: HistoryStore, private readonly scanner: TaskScannerOptions = DEFAULT_TASK_SCANNER_OPTIONS) {
     this.data = { version: 1, workspace, items: [] };
   }
 
@@ -205,7 +225,7 @@ export class TaskQueue {
         await waitForLegacyWorkspaceIdle(this.workspace, this.abortController.signal, this.logger, undefined,
           sessionId => (this.data.ignoredWaitingTaskIds ?? []).includes(sessionId));
         if (item.kind !== "message") {
-          const delay = remainingTaskDispatchDelay(this.data.items, Date.now());
+          const delay = remainingTaskDispatchDelay(this.data.items, Date.now(), this.scanner.interTaskDelayMs);
           if (delay > 0) {
             this.logger.info(`Waiting ${delay}ms before dispatching the next queued task for ${this.workspace}.`);
             await abortableDelay(delay, this.abortController.signal);
@@ -246,6 +266,8 @@ export class TaskQueue {
             afterRecoveryMarker: item.lastRecoveryMarker,
             afterFailureMarker: item.lastFailureMarker,
             afterTestTimeoutMarker: item.lastTestTimeoutMarker,
+            terminalStabilityMs: this.scanner.terminalStabilityMs,
+            detectTestTimeouts: this.scanner.enabled && this.scanner.detectTestTimeouts,
             onSessionObserved: async sessionId => {
               item.sessionId = sessionId;
               await this.persist();
@@ -274,7 +296,7 @@ export class TaskQueue {
           this.logger.info(`Requested continuation after Cline task failure ${result.failureMarker}.`);
           continue;
         }
-        if (item.kind !== "message" && result.status === "test_timeout") {
+        if (this.scanner.enabled && this.scanner.detectTestTimeouts && item.kind !== "message" && result.status === "test_timeout") {
           item.lastTestTimeoutMarker = result.testTimeoutMarker;
           item.error = result.errorText;
           await this.persist();
@@ -283,7 +305,7 @@ export class TaskQueue {
           this.logger.info(`Completion blocked by unresolved test timeout ${result.testTimeoutMarker}.`);
           continue;
         }
-        const completionAudit = item.kind !== "message" && result.status === "completed" ? auditCompletionReport(result.completionText, result.taskProgressText) : undefined;
+        const completionAudit = this.scanner.enabled && this.scanner.detectIncompleteCompletions && item.kind !== "message" && result.status === "completed" ? auditCompletionReport(result.completionText, result.taskProgressText) : undefined;
         if (completionAudit?.requiresContinuation) {
           item.incompleteCompletionClaims = (item.incompleteCompletionClaims ?? (item.lastCompletionMarker ? 1 : 0)) + 1;
           item.lastCompletionMarker = result.completionMarker;
@@ -296,6 +318,20 @@ export class TaskQueue {
           }
           this.logger.info(`Mandatory completion audit retained Cline task ${result.sessionId}: ${completionAudit.reason}.`);
           continue;
+        }
+        if (this.scanner.enabled && this.scanner.implementAuditRecommendations && item.kind !== "message" && result.status === "completed") {
+          const recommendations = extractAuditRecommendations(item.prompt, result.completionText);
+          const handled = new Set(item.handledAuditRecommendationKeys ?? []);
+          const unhandled = selectUnhandledAuditRecommendations(recommendations, [...handled]);
+          if (unhandled.length) {
+            item.lastCompletionMarker = result.completionMarker;
+            item.handledAuditRecommendationKeys = [...handled, ...unhandled.map(recommendationKey)].slice(-100);
+            await this.persist();
+            await this.adapter.sendMessage(auditRecommendationFollowup(unhandled, this.scanner.requirePostImplementationReport));
+            this.recordHistoryEvent({ type: "audit_recommendations_requested", source: "scanner", taskId: item.id, queueItemId: item.id, clineSessionId: result.sessionId, payload: { completionMarker: result.completionMarker, recommendations: unhandled, requirePostImplementationReport: this.scanner.requirePostImplementationReport } });
+            this.logger.info(`Retained audit task ${result.sessionId} to implement ${unhandled.length} recommendation(s).`);
+            continue;
+          }
         }
         item.finishedAt = new Date().toISOString();
         item.state = result.status === "deleted" ? "skipped" : result.status === "completed" && (result.exitCode === undefined || result.exitCode === 0) ? "completed" : "failed";
@@ -429,6 +465,23 @@ export function incompleteCompletionFollowup(claimCount: number, remainingSteps:
 export function testTimeoutFollowup(command?: string): string {
   const exactCommand = command ? `\n\nTimed-out test command:\n${JSON.stringify(command)}` : "";
   return `Do not complete the task: a test command timed out and the timeout is unresolved.${exactCommand}\n\nDiagnose whether the hang is in the production code, test fixture, teardown, background worker, async task, subprocess, or test runner. Improve the tests so every potentially blocking operation has a justified bounded timeout and cleanup path, and add or strengthen a regression test that reproduces the hang without leaving processes or threads behind. Then rerun the timed-out test scope (not merely a narrower substitute) and provide explicit passing output. If the original scope is inherently long-running, use an explicit justified outer timeout and progress evidence; do not reinterpret a timeout as a pass.`;
+}
+
+export function auditRecommendationFollowup(recommendations: string[], requireReport = true): string {
+  const items = recommendations.map((item, index) => `${index + 1}. ${JSON.stringify(item)}`).join("\n");
+  const report = requireReport
+    ? " After implementation and validation, create a durable post-remediation report describing each recommendation, the change made, validation evidence, residual risk, and any justified blocker."
+    : "";
+  return `This task is an audit and its completion report contains actionable recommendations. Do not start a new task and do not stop at recommendations. Implement the following recommendations in this same task within the current workspace:\n${items}\n\nValidate every implemented recommendation and accurately report any item that requires unavailable authority or cannot be completed safely.${report} Do not claim completion until this remediation work is finished.`;
+}
+
+export function selectUnhandledAuditRecommendations(recommendations: string[], handledKeys: string[]): string[] {
+  const handled = new Set(handledKeys);
+  return recommendations.filter(recommendation => !handled.has(recommendationKey(recommendation)));
+}
+
+function recommendationKey(recommendation: string): string {
+  return recommendation.toLocaleLowerCase().replace(/\s+/g, " ").trim();
 }
 
 function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {

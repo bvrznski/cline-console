@@ -201,16 +201,16 @@ A queued task advances only after all of these conditions hold:
    session metadata cannot independently authorize completion.
 2. Cline records `completion_result`; `resume_task` remains incomplete and
    blocks the queue.
-3. The result remains continuously terminal for at least 30 seconds. Any
+3. The result remains continuously terminal for at least 15 seconds. Any
    resumed activity resets that confirmation timer.
 4. The mandatory completion audit finds no incomplete task-progress counter and no
    structured remaining, outstanding, pending, future, deferred, open,
    incomplete, or partial-work declaration. A missing or truncated body is not
    sufficient by itself to classify a task as incomplete.
-5. After confirmation, a separate 30-second inter-task cooldown completes.
+5. After confirmation, a separate 15-second inter-task cooldown completes.
 6. Workspace activity is checked again immediately before dispatch.
 
-Consequently, at least 60 seconds normally pass between the first terminal
+Consequently, at least 30 seconds normally pass between the first terminal
 signal and the next task. Queued follow-up messages do not use the task-to-task
 cooldown. If an observed running queue task is deleted from Cline history, it is
 marked skipped and the next matching FIFO item may advance immediately.
@@ -243,6 +243,30 @@ completion. The scanner quotes the timed-out command and requires diagnosis,
 bounded timeout and cleanup behavior, regression coverage, and a successful
 rerun of the same test scope. A passing narrower command does not clear the
 original timeout, and a timeout is never treated as passing evidence.
+
+#### Global task-scanner configuration
+
+The completion scanner is intentionally active by default and its settings use
+VS Code's application scope, so they apply globally rather than changing from
+workspace to workspace. The defaults are:
+
+| Setting | Default | Workflow effect |
+| --- | ---: | --- |
+| `cline-console.taskScanner.enabled` | `true` | Enables completion scanning and same-task continuation policies. |
+| `cline-console.taskScanner.terminalStabilitySeconds` | `15` | Requires a stable terminal result before evaluating completion. |
+| `cline-console.taskScanner.interTaskDelaySeconds` | `15` | Delays the next queued task after confirmed completion. |
+| `cline-console.taskScanner.detectIncompleteCompletions` | `true` | Continues tasks whose progress or report declares unfinished work. |
+| `cline-console.taskScanner.detectTestTimeouts` | `true` | Treats an unresolved recognized test timeout as incomplete. |
+| `cline-console.taskScanner.implementAuditRecommendations` | `true` | Converts concrete recommendations from audit, assessment, inspection, compliance-review, security-review, and code-review reports into same-task remediation work. |
+| `cline-console.taskScanner.requirePostImplementationReport` | `true` | Requires a durable post-remediation report covering changes, validation, residual risk, and blockers. |
+
+With the defaults, an audit is not considered finished merely because it has
+produced findings and recommendations. Concrete recommendations are returned to
+the same Cline task for implementation, subject to the original task's authority
+and safety constraints. The scanner tracks normalized recommendation text so an
+unchanged recommendation list is not issued repeatedly. Change these settings
+in VS Code's User Settings and reload the extension host for a running queue to
+adopt the new values.
 
 If Cline records an explicit provider context-window overflow error, the worker
 sends `/compact` to the same task, waits for compaction processing, and then

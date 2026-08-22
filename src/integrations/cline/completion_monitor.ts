@@ -11,6 +11,7 @@ export interface TaskCompletionMonitorOptions {
   deletionGraceMs?: number;
   pollIntervalMs?: number;
   terminalStabilityMs?: number;
+  detectTestTimeouts?: boolean;
   knownSessionId?: string;
   afterCompletionMarker?: string;
   afterRecoveryMarker?: string;
@@ -172,11 +173,11 @@ export async function waitForLegacyTaskCompletion(workspace: string, prompt: str
   const earliest = Date.parse(dispatchedAt) - 5_000;
   const deletionDeadline = Date.now() + (options.deletionGraceMs ?? 15_000);
   const pollIntervalMs = options.pollIntervalMs ?? 5_000;
-  const terminalStabilityMs = options.terminalStabilityMs ?? 30_000;
+  const terminalStabilityMs = options.terminalStabilityMs ?? 15_000;
   let observedUiSessionId = options.knownSessionId;
   let terminalCandidate: { key: string; firstObservedAt: number; result: CompletionResult } | undefined;
   while (!signal.aborted) {
-    const uiLookup = await findMatchingUiTask(vscodeStorage, workspace, prompt, earliest, observedUiSessionId, options.afterRecoveryMarker, options.afterFailureMarker, options.afterTestTimeoutMarker);
+    const uiLookup = await findMatchingUiTask(vscodeStorage, workspace, prompt, earliest, observedUiSessionId, options.afterRecoveryMarker, options.afterFailureMarker, options.afterTestTimeoutMarker, options.detectTestTimeouts ?? true);
     const uiMatch = uiLookup.match;
     if (uiMatch && uiMatch.sessionId !== observedUiSessionId) {
       observedUiSessionId = uiMatch.sessionId;
@@ -227,7 +228,7 @@ function updateTerminalCandidate(candidate: { key: string; firstObservedAt: numb
   return { key, firstObservedAt: Date.now(), result };
 }
 
-async function findMatchingUiTask(storage: string, workspace: string, prompt: string, earliest: number, knownSessionId?: string, afterRecoveryMarker?: string, afterFailureMarker?: string, afterTestTimeoutMarker?: string): Promise<{ historyAvailable: boolean; match?: CompletionResult }> {
+async function findMatchingUiTask(storage: string, workspace: string, prompt: string, earliest: number, knownSessionId?: string, afterRecoveryMarker?: string, afterFailureMarker?: string, afterTestTimeoutMarker?: string, detectTestTimeouts = true): Promise<{ historyAvailable: boolean; match?: CompletionResult }> {
   try {
     const history = JSON.parse(await fs.readFile(path.join(storage, "state", "taskHistory.json"), "utf8")) as Array<Record<string, unknown>>;
     const entry = [...history].reverse().find(item => item.cwdOnTaskInitialization === workspace && typeof item.id === "string" && (
@@ -248,7 +249,7 @@ async function findMatchingUiTask(storage: string, workspace: string, prompt: st
     }
     const completed = last.ask === "completion_result" || last.say === "completion_result";
     const waiting = last.ask === "resume_task";
-    const testTimeout = completed ? findUnresolvedTestTimeout(messages, sessionId, String(last.ts ?? messages.length)) : undefined;
+    const testTimeout = completed && detectTestTimeouts ? findUnresolvedTestTimeout(messages, sessionId, String(last.ts ?? messages.length)) : undefined;
     if (testTimeout) {
       if (testTimeout.marker !== afterTestTimeoutMarker) return { historyAvailable: true, match: { sessionId, status: "test_timeout", testTimeoutMarker: testTimeout.marker, timedOutCommand: testTimeout.command, errorText: testTimeout.text } };
       return { historyAvailable: true, match: { sessionId, status: "waiting" } };
