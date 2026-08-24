@@ -276,12 +276,11 @@ automatic compaction.
 
 The workspace policy watcher explicitly forbids Cline's `new_task` handoff for
 all future tasks, including tasks started directly rather than through the
-queue. It answers each persisted handoff once with `/compact` followed by
-a direct same-thread completion instruction, and never dispatches the proposed
-handoff as a new task. Compaction and completion are persisted as separate
-recovery stages, so a temporarily blocked follow-up is retried without sending
-`/compact` repeatedly. Each send is bounded by a timeout and handled markers
-survive extension restarts.
+queue. It selects the exact requesting Cline session and answers each persisted
+handoff once with a direct same-thread completion instruction containing the
+proposed handoff context. It never dispatches that context as a new task.
+Compaction remains reserved for an actual context-window overflow. Each send is
+bounded by a timeout and handled markers survive extension restarts.
 
 #### Clearing queues and history
 

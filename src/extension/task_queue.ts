@@ -186,16 +186,12 @@ export class TaskQueue {
       try {
         const handoff = await getLegacyNewTaskHandoff(this.workspace);
         if (handoff && !(this.data.handledNewTaskMarkers ?? []).includes(handoff.marker)) {
-          if (!(this.data.compactedNewTaskMarkers ?? []).includes(handoff.marker)) {
-            this.recordHistoryEvent({ type: "new_task_handoff_detected", source: "scanner", observed: true, clineSessionId: handoff.sessionId, payload: { marker: handoff.marker, proposedContext: handoff.text } });
-            await withTimeout(this.adapter.sendMessage("/compact"), POLICY_MESSAGE_TIMEOUT_MS, "Timed out requesting Cline compaction.");
-            this.data.compactedNewTaskMarkers = [...(this.data.compactedNewTaskMarkers ?? []).slice(-99), handoff.marker];
-            await this.persist();
-            this.logger.info(`Rejected Cline new-task handoff ${handoff.marker} and requested compaction.`);
-            await abortableDelay(5_000, this.abortController.signal);
+          this.recordHistoryEvent({ type: "new_task_handoff_detected", source: "scanner", observed: true, clineSessionId: handoff.sessionId, payload: { marker: handoff.marker, proposedContext: handoff.text } });
+          if (this.adapter.resumeTask) {
+            await withTimeout(this.adapter.resumeTask(handoff.sessionId), POLICY_MESSAGE_TIMEOUT_MS, "Timed out selecting the Cline task that requested a new-task handoff.");
           }
           await withTimeout(
-            this.adapter.sendMessage("Do not start a new task. Finish all remaining work in this same thread, including implementation, tests, validation, remediation, documentation, and the final task report. Continue until every in-scope completion criterion is satisfied."),
+            this.adapter.sendMessage(newTaskHandoffFollowup(handoff.text)),
             POLICY_MESSAGE_TIMEOUT_MS,
             "Timed out requesting same-thread task completion."
           );
@@ -473,6 +469,11 @@ export function auditRecommendationFollowup(recommendations: string[], requireRe
     ? " After implementation and validation, create a durable post-remediation report describing each recommendation, the change made, validation evidence, residual risk, and any justified blocker."
     : "";
   return `This task is an audit and its completion report contains actionable recommendations. Do not start a new task and do not stop at recommendations. Implement the following recommendations in this same task within the current workspace:\n${items}\n\nValidate every implemented recommendation and accurately report any item that requires unavailable authority or cannot be completed safely.${report} Do not claim completion until this remediation work is finished.`;
+}
+
+export function newTaskHandoffFollowup(proposedContext?: string): string {
+  const context = proposedContext?.trim() ? `\n\nCline proposed this handoff context. Treat it as remaining work in this thread:\n${proposedContext.trim()}` : "";
+  return `Do not start or spawn a new task. Continue the current original task in this exact same Cline thread. Finish all remaining work, including implementation, tests, validation, remediation, documentation, and the final task report.${context}\n\nDo not request another new task. Continue until every in-scope completion criterion from the original prompt and this handoff context is satisfied.`;
 }
 
 export function selectUnhandledAuditRecommendations(recommendations: string[], handledKeys: string[]): string[] {

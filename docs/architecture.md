@@ -75,12 +75,12 @@ metadata only and deliberately omit task bodies.
    that same task. After compaction finishes, the worker requests continuation
    and retains the queue item until normal completion. Each persisted error
    record is handled at most once; ordinary context-usage telemetry is ignored.
-   A workspace-wide policy watcher rejects every persisted `new_task` handoff,
-   including for directly started tasks, by issuing `/compact` and a same-thread
-   completion instruction. It persists the compaction and completion stages
-   separately and applies timeouts, allowing a blocked completion message to be
-   retried without repeatedly compacting the same task. Handled prompt markers
-   persist across extension restarts so the response is not duplicated.
+   A workspace-wide policy watcher selects the exact requesting session and
+   rejects every persisted `new_task` handoff, including for directly started
+   tasks, with a same-thread completion instruction that preserves the proposed
+   handoff context as remaining work. It applies bounded timeouts, and handled
+   prompt markers persist across extension restarts so the response is not
+   duplicated. Compaction is reserved for actual context-window overflow.
    If an observed queued task disappears
    from Cline's exact-workspace history, it is marked skipped and the next item
    is dispatched without the normal task-to-task cooldown.

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { formatQueue, formatQueues } from "../src/client/commands/queue";
-import { auditRecommendationFollowup, discoverPersistedQueueStatuses, incompleteCompletionFollowup, readQueueStatusFile, remainingTaskDispatchDelay, selectUnhandledAuditRecommendations, TaskQueue, testTimeoutFollowup } from "../src/extension/task_queue";
+import { auditRecommendationFollowup, discoverPersistedQueueStatuses, incompleteCompletionFollowup, newTaskHandoffFollowup, readQueueStatusFile, remainingTaskDispatchDelay, selectUnhandledAuditRecommendations, TaskQueue, testTimeoutFollowup } from "../src/extension/task_queue";
 import type { ClineAdapter } from "../src/integrations/cline/types";
 import type { Logger } from "../src/common/logging";
 import { deleteLegacyQueuedTaskHistory, deleteLegacyWorkspaceTaskHistory, getLegacyUnfinishedWorkspaceTasks } from "../src/integrations/cline/task_history";
@@ -42,6 +42,15 @@ test("audit recommendation follow-up requires implementation and a post-remediat
   assert.match(followup, /residual risk/);
   assert.doesNotMatch(auditRecommendationFollowup(["Fix it"], false), /post-remediation report/);
   assert.deepEqual(selectUnhandledAuditRecommendations(["Restrict SSH access", "Add tests"], ["restrict ssh access"]), ["Add tests"]);
+});
+
+test("new-task handoff follow-up keeps post-completion work in the exact thread", () => {
+  const followup = newTaskHandoffFollowup("Phase 3.25 pending tasks:\n- Implement RecoveryPipeline\n- Run certification");
+  assert.match(followup, /Do not start or spawn a new task/);
+  assert.match(followup, /exact same Cline thread/);
+  assert.match(followup, /Phase 3\.25 pending tasks/);
+  assert.match(followup, /Implement RecoveryPipeline/);
+  assert.match(followup, /final task report/);
 });
 
 function adapterWithStatus(task: "active" | "none", state: "running" | "unknown"): ClineAdapter {
