@@ -145,7 +145,7 @@
     "verify:release": "npm test && npm audit && npm pack --dry-run && vsce ls --tree"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^26.4.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.6.0",
     "typescript": "^5.7.0"
