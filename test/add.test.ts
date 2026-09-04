@@ -15,6 +15,22 @@ test("add reads multiple task files in argument order without normalization", as
   await fs.rm(root, { recursive: true });
 });
 
+test("queue add accepts positional task files without an explicit file flag", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-add-positional-"));
+  const first = path.join(root, "9.1"), second = path.join(root, "9.2");
+  await fs.writeFile(first, "phase 9.1");
+  await fs.writeFile(second, "phase 9.2");
+  const tasks = await readTasks([first, second]);
+  assert.deepEqual(tasks.map(task => task.sourcePath), [first, second]);
+  assert.deepEqual(tasks.map(task => task.prompt), ["phase 9.1", "phase 9.2"]);
+  await fs.rm(root, { recursive: true });
+});
+
+test("queue add positional input rejects missing paths and option-like values", async () => {
+  await assert.rejects(readTasks([]), /requires one or more task file paths/);
+  await assert.rejects(readTasks(["--unknown"]), /requires one or more task file paths/);
+});
+
 test("add directory recursively discovers regular files in deterministic relative-path order", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-add-dir-"));
   const nested = path.join(root, "nested"); await fs.mkdir(nested);

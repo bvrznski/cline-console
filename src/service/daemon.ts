@@ -92,9 +92,10 @@ export class ClineConsoleService {
   }
 
   async stop(): Promise<void> {
-    if (this.server) await new Promise<void>(resolve => this.server!.close(() => resolve()));
-    await fs.unlink(this.socketPath).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
+    const server = this.server;
     this.server = undefined;
+    if (server?.listening) await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await fs.unlink(this.socketPath).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
     this.logger.info("Singleton service stopped.");
   }
 }

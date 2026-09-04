@@ -6,7 +6,7 @@ import { taskTitle } from "../common/task_title";
 import type { Logger } from "../common/logging";
 import type { ClineAdapter } from "../integrations/cline/types";
 import type { QueueStatus } from "../ipc/types";
-import { getLegacyNewTaskHandoff, waitForLegacyMessageCompletion, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle } from "../integrations/cline/completion_monitor";
+import { getLegacyNewTaskHandoff, waitForLegacyMessageCompletion, waitForLegacyNewTaskHandoffAcknowledgement, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle } from "../integrations/cline/completion_monitor";
 import { auditCompletionReport, extractAuditRecommendations, extractRemainingSteps } from "../integrations/cline/remaining_work";
 import type { HistoryStore } from "../history/history_store";
 
@@ -16,6 +16,7 @@ interface QueueFile { version: 1; workspace: string; paused?: boolean; ignoredWa
 export const TASK_DISPATCH_DELAY_MS = 15_000;
 export const DISPATCH_STABILITY_DELAY_MS = 1_000;
 export const POLICY_MESSAGE_TIMEOUT_MS = 30_000;
+export const QUEUE_WORKER_RETRY_DELAY_MS = 5_000;
 
 export interface TaskScannerOptions {
   enabled: boolean;
@@ -171,14 +172,19 @@ export class TaskQueue {
   }
 
   private kick(): void {
-    if (!this.worker) this.worker = this.process().finally(() => {
+    if (!this.worker) this.worker = this.process().catch(async error => {
+      if (!this.abortController.signal.aborted) this.logger.error(`Queue worker failed safely for ${this.workspace}: ${String(error)}`);
+      await abortableDelay(QUEUE_WORKER_RETRY_DELAY_MS, this.abortController.signal);
+    }).finally(() => {
       this.worker = undefined;
       if (!this.abortController.signal.aborted && !this.data.paused && this.data.items.some(item => item.state === "queued" || item.state === "running")) this.kick();
     });
   }
 
   private startPolicyMonitor(): void {
-    if (!this.policyWorker) this.policyWorker = this.monitorNewTaskHandoffs().finally(() => { this.policyWorker = undefined; });
+    if (!this.policyWorker) this.policyWorker = this.monitorNewTaskHandoffs().catch(error => {
+      if (!this.abortController.signal.aborted) this.logger.error(`New-task policy monitor failed safely for ${this.workspace}: ${String(error)}`);
+    }).finally(() => { this.policyWorker = undefined; });
   }
 
   private async monitorNewTaskHandoffs(): Promise<void> {
@@ -189,12 +195,18 @@ export class TaskQueue {
           this.recordHistoryEvent({ type: "new_task_handoff_detected", source: "scanner", observed: true, clineSessionId: handoff.sessionId, payload: { marker: handoff.marker, proposedContext: handoff.text } });
           if (this.adapter.resumeTask) {
             await withTimeout(this.adapter.resumeTask(handoff.sessionId), POLICY_MESSAGE_TIMEOUT_MS, "Timed out selecting the Cline task that requested a new-task handoff.");
+            // showTaskWithId resolves before Cline's webview always finishes
+            // selecting the historical task. Give the target a bounded moment
+            // to become the active recipient before sending the policy message.
+            await abortableDelay(DISPATCH_STABILITY_DELAY_MS, this.abortController.signal);
           }
           await withTimeout(
             this.adapter.sendMessage(newTaskHandoffFollowup(handoff.text)),
             POLICY_MESSAGE_TIMEOUT_MS,
             "Timed out requesting same-thread task completion."
           );
+          const delivered = await waitForLegacyNewTaskHandoffAcknowledgement(handoff, this.abortController.signal);
+          if (!delivered) throw new Error(`Cline did not record the same-thread continuation for ${handoff.marker}; delivery will be retried.`);
           this.data.handledNewTaskMarkers = [...(this.data.handledNewTaskMarkers ?? []).slice(-99), handoff.marker];
           this.data.compactedNewTaskMarkers = (this.data.compactedNewTaskMarkers ?? []).filter(marker => marker !== handoff.marker);
           await this.persist();

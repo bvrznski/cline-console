@@ -21,7 +21,15 @@ export async function readTasks(args: string[]): Promise<Array<{ sourcePath: str
   const newerMarker = args.findIndex(arg => arg === "--newer-than");
   if (directoryMarker >= 0 && fileMarker >= 0) throw new ClineConsoleError("AMBIGUOUS_INPUT", "Use either -f files or -d directory, not both.");
   if (newerMarker >= 0 && directoryMarker < 0) throw new ClineConsoleError("INVALID_ARGUMENT", "--newer-than is valid only with --dir.");
-  if (directoryMarker < 0) return readTaskFiles(args);
+  if (directoryMarker < 0) {
+    if (fileMarker < 0) {
+      if (!args.length || args.some(argument => argument.startsWith("-"))) {
+        throw new ClineConsoleError("MISSING_FILE", "queue add requires one or more task file paths, optionally preceded by -f/--file.");
+      }
+      return readTaskFiles(["-f", ...args]);
+    }
+    return readTaskFiles(args);
+  }
   const directoryArgument = args[directoryMarker + 1];
   if (!directoryArgument) throw new ClineConsoleError("MISSING_DIRECTORY", "-d/--dir requires a path.");
   const expectedLength = newerMarker >= 0 ? 4 : 2;

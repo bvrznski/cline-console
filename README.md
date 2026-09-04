@@ -279,8 +279,22 @@ all future tasks, including tasks started directly rather than through the
 queue. It selects the exact requesting Cline session and answers each persisted
 handoff once with a direct same-thread completion instruction containing the
 proposed handoff context. It never dispatches that context as a new task.
-Compaction remains reserved for an actual context-window overflow. Each send is
-bounded by a timeout and handled markers survive extension restarts.
+The watcher checks recent exact-workspace predecessor sessions as well as the
+latest session, so a fast Cline task rollover cannot hide the request. A parked
+latest handoff remains actionable across long pauses; stale predecessor
+handoffs are ignored. Compaction remains reserved for an actual context-window
+overflow. Each send is bounded by a timeout, and the watcher verifies that
+Cline persisted the same-thread instruction before recording the handoff as
+handled. Failed or misdirected delivery is retried, while verified handled
+markers survive extension restarts.
+
+Status reconciliation also distinguishes evidence of a live run from stale UI
+metadata. A live session PID is authoritative. UI-only activity older than 15
+minutes without a terminal, waiting, or failure record is reported as no task
+running, preventing an abandoned UI record from blocking the queue forever.
+Persisted structured and text variants of Cline's YOLO stop/failure messages are
+reported as failures until a real retry begins; source code and tool payloads
+that merely quote those words do not trigger the detector.
 
 #### Clearing queues and history
 
@@ -345,7 +359,13 @@ cline-console service run
 
 `service install` creates and enables
 `~/.config/systemd/user/cline-console.service`. Only one service may own the
-local routing socket. `service run` is intended for foreground diagnostics.
+local routing socket. The service runs independently of invoking terminals and
+uses `Restart=on-failure`. Transient file-log failures fall back to the systemd
+journal instead of terminating the daemon. Its unit applies a private umask,
+explicit journal output, and a bounded stop timeout. Detached queue workers
+contain unexpected failures and retry after a bounded delay rather than
+creating an unhandled rejection or tight loop. `service run` is intended only
+for foreground diagnostics.
 
 ## Workspace selection
 

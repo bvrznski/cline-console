@@ -35,7 +35,7 @@ Usage:
   cline-console [OPTIONS] task status
   cline-console [OPTIONS] tasks
   cline-console --workspace PATH tasks stop|reload|finish
-  cline-console --workspace PATH queue add (--file FILE...|--dir DIRECTORY [--newer-than FILE]) [--resume]
+  cline-console --workspace PATH queue add (FILE...|--file FILE...|--dir DIRECTORY [--newer-than FILE]) [--resume]
   cline-console --workspace PATH queue replace (--file FILE...|--dir DIRECTORY [--newer-than FILE])
   cline-console [OPTIONS] queue list
   cline-console --workspace PATH queue remove (--file PATH|--title TITLE|--id ID)
@@ -306,7 +306,12 @@ async function runServiceCommand(args: string[]): Promise<number> {
     const logger = fileLogger("info"), service = new ClineConsoleService(logger);
     await service.start();
     await new Promise<void>((resolve, reject) => {
-      const shutdown = (): void => { service.stop().then(resolve, reject); };
+      let stopping = false;
+      const shutdown = (): void => {
+        if (stopping) return;
+        stopping = true;
+        service.stop().then(resolve, reject);
+      };
       process.once("SIGTERM", shutdown); process.once("SIGINT", shutdown);
     });
     return 0;

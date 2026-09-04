@@ -24,25 +24,55 @@ export interface WorkspaceSessionStatus { sessionId: string; status: string; obs
 export interface WorkspaceTaskPrompt { sessionId: string; prompt: string; }
 export interface NewTaskHandoff { sessionId: string; marker: string; text?: string; }
 export const BRIDGE_SUBMISSION_GRACE_MS = 30_000;
+export const UI_RUNNING_STALE_MS = 15 * 60_000;
+const SAME_THREAD_INSTRUCTION = /(?:finish|continue|remain|work)\s+(?:the\s+)?(?:current\s+)?(?:original\s+)?(?:task\s+)?in\s+this\s+(?:exact\s+)?(?:same\s+)?thread/i;
 
 export async function getLegacyNewTaskHandoff(workspace: string, vscodeStorageOverride?: string): Promise<NewTaskHandoff | undefined> {
   const storage = vscodeStorageOverride || process.env.CLINE_VSCODE_STORAGE_DIR?.trim() || path.join(os.homedir(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
   try {
     const history = JSON.parse(await fs.readFile(path.join(storage, "state", "taskHistory.json"), "utf8")) as Array<Record<string, unknown>>;
-    const entry = [...history].reverse().find(item => item.cwdOnTaskInitialization === workspace && typeof item.id === "string");
-    if (!entry) return undefined;
-    const sessionId = String(entry.id);
-    const messages = JSON.parse(await fs.readFile(path.join(storage, "tasks", sessionId, "ui_messages.json"), "utf8")) as Array<Record<string, unknown>>;
-    let handoffIndex = -1;
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      if (messages[index].ask === "new_task") { handoffIndex = index; break; }
+    const entries = [...history].reverse().filter(item => item.cwdOnTaskInitialization === workspace && typeof item.id === "string").slice(0, 50);
+    for (const [entryIndex, entry] of entries.entries()) {
+      const sessionId = String(entry.id);
+      const file = path.join(storage, "tasks", sessionId, "ui_messages.json");
+      let messages: Array<Record<string, unknown>>;
+      let metadata;
+      try { [messages, metadata] = await Promise.all([fs.readFile(file, "utf8").then(raw => JSON.parse(raw)), fs.stat(file)]); }
+      catch { continue; }
+      // A predecessor may contain the handoff after Cline has already selected a
+      // successor. Scan recent exact-workspace sessions so that rollover cannot
+      // hide the request, while ignoring old historical handoffs.
+      // The latest workspace task may remain parked at resume_task overnight;
+      // its handoff is still actionable. Apply the age bound only to older
+      // predecessor sessions discovered for rollover-race recovery.
+      if (entryIndex > 0 && Date.now() - metadata.mtimeMs > UI_RUNNING_STALE_MS) continue;
+      let handoffIndex = -1;
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        if (messages[index].ask === "new_task") { handoffIndex = index; break; }
+      }
+      if (handoffIndex < 0) continue;
+      const alreadyRejected = messages.slice(handoffIndex + 1).some(message => typeof message.text === "string" && SAME_THREAD_INSTRUCTION.test(message.text));
+      if (alreadyRejected) continue;
+      const handoff = messages[handoffIndex];
+      return { sessionId, marker: `${sessionId}:${String(handoff.ts ?? handoffIndex)}`, ...(typeof handoff.text === "string" ? { text: handoff.text } : {}) };
     }
-    if (handoffIndex < 0) return undefined;
-    const alreadyRejected = messages.slice(handoffIndex + 1).some(message => typeof message.text === "string" && message.text.includes("Finish in this thread."));
-    if (alreadyRejected) return undefined;
-    const handoff = messages[handoffIndex];
-    return { sessionId, marker: `${sessionId}:${String(handoff.ts ?? handoffIndex)}`, ...(typeof handoff.text === "string" ? { text: handoff.text } : {}) };
+    return undefined;
   } catch { return undefined; }
+}
+
+export async function waitForLegacyNewTaskHandoffAcknowledgement(handoff: NewTaskHandoff, signal: AbortSignal, vscodeStorageOverride?: string, timeoutMs = 10_000): Promise<boolean> {
+  const storage = vscodeStorageOverride || process.env.CLINE_VSCODE_STORAGE_DIR?.trim() || path.join(os.homedir(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
+  const file = path.join(storage, "tasks", handoff.sessionId, "ui_messages.json");
+  const deadline = Date.now() + timeoutMs;
+  while (!signal.aborted && Date.now() <= deadline) {
+    try {
+      const messages = JSON.parse(await fs.readFile(file, "utf8")) as Array<Record<string, unknown>>;
+      const handoffIndex = messages.findIndex((message, index) => message.ask === "new_task" && `${handoff.sessionId}:${String(message.ts ?? index)}` === handoff.marker);
+      if (handoffIndex >= 0 && messages.slice(handoffIndex + 1).some(message => typeof message.text === "string" && SAME_THREAD_INSTRUCTION.test(message.text))) return true;
+    } catch { /* The UI message file may be updating atomically. */ }
+    await abortableDelay(Math.min(250, Math.max(0, deadline - Date.now())), signal);
+  }
+  return false;
 }
 
 export async function getLatestLegacyWorkspaceTaskPrompt(workspace: string, clineRootOverride?: string, vscodeStorageOverride?: string): Promise<WorkspaceTaskPrompt | undefined> {
@@ -78,7 +108,11 @@ export async function getLegacyWorkspaceSessionStatus(workspace: string, clineRo
   names.sort().reverse();
   for (const name of names.slice(0, 200)) {
     const session = await readSession(directory, name, workspace, true);
-    if (session) return !uiTask || Date.parse(session.observedAt) > Date.parse(uiTask.observedAt) ? session : uiTask;
+    if (session) {
+      // A live PID is stronger evidence than an old UI message timestamp.
+      if (session.status === "running") return session;
+      return !uiTask || Date.parse(session.observedAt) > Date.parse(uiTask.observedAt) ? session : uiTask;
+    }
   }
   return uiTask;
 }
@@ -97,7 +131,8 @@ async function getLegacyUiTaskStatus(workspace: string, storage: string): Promis
     const failure = findUnresolvedTaskFailure(messages, sessionId);
     const terminal = last.ask === "completion_result" || last.say === "completion_result";
     const waiting = last.ask === "resume_task";
-    return { sessionId, status: failure ? "failed" : terminal ? "completed" : waiting ? "waiting" : "running", observedAt: metadata.mtime.toISOString(), title: taskTitle(entry.task), ...(failure ? { errorText: failure.text } : {}) };
+    const staleRunning = !failure && !terminal && !waiting && Date.now() - metadata.mtimeMs > UI_RUNNING_STALE_MS;
+    return { sessionId, status: failure ? "failed" : terminal ? "completed" : waiting ? "waiting" : staleRunning ? "stale" : "running", observedAt: metadata.mtime.toISOString(), title: taskTitle(entry.task), ...(failure ? { errorText: failure.text } : {}) };
   } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; return undefined; }
 }
 
@@ -114,14 +149,15 @@ export function reconcileLegacyStatus(status: ClineStatus, session: WorkspaceSes
     return { ...status, title: session.title ?? status.title, detail: "Active bridge submission is newer than Cline's latest workspace session metadata." };
   }
   if (session.status === "running") return { ...status, task: "active", state: "running", taskId: session.sessionId, title: session.title, detail: "Status reconciled from Cline's latest workspace session metadata." };
+  if (session.status === "stale") return { ...status, task: "none", state: "idle", taskId: undefined, title: undefined, detail: "No task is running in this workspace." };
   if (session.status === "waiting") return { ...status, task: "active", state: "waiting", taskId: session.sessionId, title: session.title, detail: "Task is incomplete and waiting for Cline's resume action." };
   if (session.status === "failed" || (session.exitCode !== undefined && session.exitCode !== 0)) return { ...status, task: "failed", state: "failed", taskId: session.sessionId, title: session.title, detail: session.errorText ?? "Status reconciled from Cline's latest workspace session metadata." };
   if (session.status === "idle" || session.status === "completed") return { ...status, task: "completed", state: session.status, taskId: session.sessionId, title: session.title, detail: "Status reconciled from Cline's latest workspace session metadata." };
   return { ...status, task: "unknown", state: "unknown", taskId: session.sessionId, title: session.title, detail: `Latest Cline session has unrecognized status '${session.status}'.` };
 }
 
-export async function getLegacyWorkspaceActivity(workspace: string, clineRootOverride?: string): Promise<WorkspaceActivity> {
-  const session = await getLegacyWorkspaceSessionStatus(workspace, clineRootOverride);
+export async function getLegacyWorkspaceActivity(workspace: string, clineRootOverride?: string, vscodeStorageOverride?: string): Promise<WorkspaceActivity> {
+  const session = await getLegacyWorkspaceSessionStatus(workspace, clineRootOverride, vscodeStorageOverride);
   if (!session || !(["running", "waiting", "idle", "completed", "failed"] as string[]).includes(session.status)) return { active: false };
   return { active: true, sessionId: session.sessionId, status: session.status as WorkspaceActivity["status"] };
 }
@@ -163,7 +199,9 @@ export async function waitForLegacyWorkspaceIdle(workspace: string, signal: Abor
     if (!announced) { logger.info(`Queue waiting for existing Cline session ${current.sessionId} in ${workspace}.`); announced = true; }
     await abortableDelay(5_000, signal);
   }
-  throw new Error("Queue monitor stopped.");
+  // Queue clear/stop deliberately aborts this pre-dispatch wait. Treat that
+  // control-flow signal as a clean shutdown so the first clear request cannot
+  // inherit an expected monitor cancellation as an INTERNAL_ERROR.
 }
 
 export async function waitForLegacyTaskCompletion(workspace: string, prompt: string, dispatchedAt: string, signal: AbortSignal, logger: Logger, clineRootOverride?: string, vscodeStorageOverride?: string, options: TaskCompletionMonitorOptions = {}): Promise<CompletionResult> {
@@ -304,14 +342,48 @@ function timeoutSummary(text: string): string {
 }
 
 function findUnresolvedTaskFailure(messages: Array<Record<string, unknown>>, sessionId: string): { marker: string; text: string } | undefined {
+  let candidate: { index: number; marker: string; text: string } | undefined;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message.say === "api_req_started" || message.say === "user_feedback" || message.ask === "completion_result" || message.say === "completion_result") return undefined;
-    if (message.say === "error" && typeof message.text === "string" && /\bTask failed\s*:/i.test(message.text)) {
-      return { marker: `${sessionId}:${String(message.ts ?? index)}`, text: message.text };
-    }
+    const text = yoloFailureText(messages[index]);
+    if (text) { candidate = { index, marker: `${sessionId}:${String(messages[index].ts ?? index)}`, text }; break; }
   }
-  return undefined;
+  if (!candidate) return undefined;
+
+  let recoveryRequested = false;
+  for (const message of messages.slice(candidate.index + 1)) {
+    if (message.ask === "completion_result" || message.say === "completion_result") return undefined;
+    if (message.ask === "resume_task" || message.say === "user_feedback") recoveryRequested = true;
+    if (recoveryRequested && message.say === "api_req_started") return undefined;
+  }
+  return candidate;
+}
+
+function yoloFailureText(message: Record<string, unknown>): string | undefined {
+  // Ordinary source code and tool output frequently contain "task failed".
+  // Only Cline error-channel records are eligible failure signals.
+  if (message.say !== "error" && message.type !== "error") return undefined;
+  const texts = collectErrorStrings(message);
+  const match = texts.find(text =>
+    /\[?YOLO MODE\]?[\s\S]{0,160}(?:task\s+failed|stopp?ed|aborted|disabled|consecutive\s+mistakes)/i.test(text)
+    || /(?:too\s+many|maximum(?:\s+number\s+of)?|limit(?:\s+of)?)[\s\S]{0,80}consecutive\s+mistakes/i.test(text)
+    || /consecutive\s+mistakes[\s\S]{0,80}(?:too\s+many|maximum|limit|task\s+failed|stopp?ed|aborted)/i.test(text)
+  );
+  return match?.trim();
+}
+
+function collectErrorStrings(value: unknown, depth = 0): string[] {
+  if (depth > 3 || value === null || value === undefined) return [];
+  if (typeof value === "string") {
+    const texts = [value];
+    const trimmed = value.trim();
+    if ((trimmed.startsWith("{") || trimmed.startsWith("[")) && trimmed.length < 100_000) {
+      try { texts.push(...collectErrorStrings(JSON.parse(trimmed), depth + 1)); } catch { /* Plain error text. */ }
+    }
+    return texts;
+  }
+  if (Array.isArray(value)) return value.flatMap(item => collectErrorStrings(item, depth + 1));
+  if (typeof value === "object") return Object.values(value as Record<string, unknown>).flatMap(item => collectErrorStrings(item, depth + 1));
+  return [];
 }
 
 async function findMatchingSession(directory: string, workspace: string, prompt: string, earliest: number): Promise<CompletionResult | undefined> {

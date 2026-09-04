@@ -78,9 +78,13 @@ metadata only and deliberately omit task bodies.
    A workspace-wide policy watcher selects the exact requesting session and
    rejects every persisted `new_task` handoff, including for directly started
    tasks, with a same-thread completion instruction that preserves the proposed
-   handoff context as remaining work. It applies bounded timeouts, and handled
-   prompt markers persist across extension restarts so the response is not
-   duplicated. Compaction is reserved for actual context-window overflow.
+   handoff context as remaining work. Recent exact-workspace predecessor tasks
+   are scanned to survive Cline's successor-selection race, while stale
+   predecessor requests are excluded. It applies bounded timeouts and verifies
+   that the instruction appears in the requesting task's persisted UI history
+   before saving its handled marker. Failed or misdirected delivery is retried;
+   verified prompt markers persist across extension restarts so the response is
+   not duplicated. Compaction is reserved for actual context-window overflow.
    If an observed queued task disappears
    from Cline's exact-workspace history, it is marked skipped and the next item
    is dispatched without the normal task-to-task cooldown.

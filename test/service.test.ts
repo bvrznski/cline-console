@@ -19,3 +19,12 @@ test("service permits exactly one live instance", async () => {
   assert.equal(await probeService(first.socketPath), false);
   await fs.rm(directory, { recursive: true });
 });
+
+test("service shutdown is idempotent", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-service-stop-"));
+  const service = new ClineConsoleService(logger, directory);
+  await service.start();
+  await assert.doesNotReject(Promise.all([service.stop(), service.stop()]));
+  assert.equal(await probeService(service.socketPath), false);
+  await fs.rm(directory, { recursive: true });
+});

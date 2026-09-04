@@ -53,6 +53,7 @@ test("canonical queue grammar preserves batches and explicit selectors", () => {
   assert.equal(add.command, "add");
   assert.deepEqual(add.commandArgs, ["--file", "one", "two"]);
   assert.equal(add.resumeAfter, true);
+  assert.deepEqual(normalizeCommand(parseArgs(["queue", "add", "/tasks/9.1"])).parsed.commandArgs, ["/tasks/9.1"]);
   assert.deepEqual(normalizeCommand(parseArgs(["queue", "replace", "--dir", "tasks"])).parsed.commandArgs, ["--dir", "tasks"]);
   assert.deepEqual(normalizeCommand(parseArgs(["queue", "remove", "--id", "abc"])).parsed.commandArgs, ["pop", "abc", "id"]);
   assert.deepEqual(normalizeCommand(parseArgs(["queue", "clear", "--force"])).parsed.commandArgs, ["clear", "--force"]);
