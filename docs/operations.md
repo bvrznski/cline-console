@@ -22,6 +22,8 @@ cline-console --workspace /repo task stop
 cline-console --workspace /repo task restart
 cline-console --workspace /repo queue pause
 cline-console --workspace /repo queue resume
+cline-console --workspace /repo --continue
+cline-console --workspace /repo --relaunch
 cline-console --workspace /repo queue add --file task.md --resume
 cline-console --workspace /repo queue add --dir tasks --newer-than checkpoint.file
 cline-console --workspace /repo queue remove --file /path/to/task.md
@@ -94,6 +96,31 @@ systemctl --user status cline-console.service
 ```
 
 The service may take a brief moment to recreate its socket after a restart.
+
+For a durable non-empty queue, 15 seconds without the exact VS Code workspace
+registration is treated as an unexpected window close. The daemon rate-limits
+automatic reopen attempts and records detection, success, and failure events.
+
+If VS Code or Linux is forcibly terminated, queue state remains in
+`$XDG_STATE_HOME/cline-console/queues` (normally
+`~/.local/state/cline-console/queues`), not in the reboot-volatile runtime
+directory. Reopening the same workspace activates the companion, which waits
+for 15 continuous seconds of Cline idle before resuming the exact interrupted
+queue head. Any running or waiting Cline activity resets or blocks this grace
+period. Explicitly paused queues remain paused. Socket and registration files
+remain under `$XDG_RUNTIME_DIR` and are recreated normally after login.
+
+If Cline itself reports the exact YOLO-mode three-consecutive-mistakes stop and
+`cline-console.taskScanner.restartOnYoloFailure` is enabled, the scanner writes
+a private daemon recovery request. The daemon verifies the exact registered
+extension-host PID via `/proc`, terminates only that process with bounded
+escalation, requests the same workspace from VS Code, and records each outcome
+in the SQLite event ledger. It never uses a broad process-name kill. The queue
+then resumes through the same 15-second idle gate described above.
+When Cline assigns a new session ID during recovery, cline-console follows the
+newer session only for an exact workspace and full-prompt match. This prevents
+the queue from remaining pinned to a failed predecessor and prevents a stale
+recovery message from reopening work that the successor already completed.
 
 ### Cline API is unsupported
 

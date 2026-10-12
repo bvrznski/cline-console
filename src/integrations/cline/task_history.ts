@@ -18,7 +18,9 @@ export async function getLegacyUnfinishedWorkspaceTasks(workspace: string, vscod
     try {
       const messages = JSON.parse(await fs.readFile(path.join(storage, "tasks", entry.id, "ui_messages.json"), "utf8")) as Array<Record<string, unknown>>;
       const completionText = [...messages].reverse().find(message =>
-        (message.ask === "completion_result" || message.say === "completion_result") && typeof message.text === "string"
+        (message.ask === "completion_result" || message.say === "completion_result")
+          && typeof message.text === "string"
+          && message.text.trim().length > 0
       )?.text;
       const taskProgressText = [...messages].reverse().find(message =>
         (message.ask === "task_progress" || message.say === "task_progress") && typeof message.text === "string"

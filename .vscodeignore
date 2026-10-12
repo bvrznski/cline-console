@@ -3,7 +3,6 @@
 .npmignore
 .github/**
 .vscode/**
-node_modules/**
 src/**
 test/**
 task.md
@@ -12,3 +11,5 @@ tsconfig.json
 *.tgz
 coverage/**
 dist/test/**
+**/__pycache__/**
+**/*.pyc

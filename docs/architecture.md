@@ -1,5 +1,8 @@
 # Architecture
 
+The normative workflow invariants and transition graphs are defined in
+[Flow principles and state machines](flow-principles-and-state-machine.md).
+
 ## Purpose
 
 Cline Console is a local control plane for the Cline extension already running

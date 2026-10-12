@@ -5,12 +5,24 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { Logger } from "../src/common/logging";
-import { IpcServer } from "../src/extension/server";
+import { IpcServer, isPollingAction, summarizeRequest, summarizeResponse } from "../src/extension/server";
 import { socketPath, workspaceId } from "../src/extension/workspace_registry";
 import type { ClineAdapter } from "../src/integrations/cline/types";
 
 const logger: Logger = { error() {}, info() {}, debug() {} };
 const adapter = {} as ClineAdapter;
+
+test("high-frequency status polling is excluded from durable IPC history", () => {
+  assert.equal(isPollingAction("queueStatus"), true);
+  assert.equal(isPollingAction("status"), true);
+  assert.equal(isPollingAction("enqueueTasks"), false);
+});
+
+test("durable IPC summaries never duplicate prompt or queue response bodies", () => {
+  const request = { protocolVersion: 1 as const, requestId: "r1", action: "enqueueTasks" as const, workspace: "/repo", payload: { tasks: [{ sourcePath: "task.md", prompt: "secret prompt" }], allowDuplicates: true } };
+  assert.deepEqual(summarizeRequest(request), { requestId: "r1", action: "enqueueTasks", taskCount: 1, payloadKeys: ["allowDuplicates", "tasks"] });
+  assert.deepEqual(summarizeResponse(request, { queueLength: 300, items: [{ prompt: "secret prompt" }] }), { requestId: "r1", action: "enqueueTasks", resultType: "object", queueLength: 300 });
+});
 
 test("server removes a stale socket and cleans up on stop", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-server-"));

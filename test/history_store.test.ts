@@ -30,3 +30,60 @@ test("SQLite history preserves full prompts, queue state, runs, and observed eve
     await fs.rm(root, { recursive: true });
   }
 });
+
+test("SQLite history opens when an Electron host returns no diagnostic report", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-history-electron-"));
+  const original = process.report.getReport;
+  (process.report as unknown as { getReport: () => undefined }).getReport = () => undefined;
+  let store: HistoryStore | undefined;
+  try {
+    store = new HistoryStore(path.join(root, "history.sqlite3"));
+    store.recordEvent("/repo", { type: "yolo_daemon_restart_completed", source: "cline-console", observed: true });
+    assert.equal(store.listTasks("/repo").length, 0);
+  } finally {
+    store?.close();
+    process.report.getReport = original;
+    await fs.rm(root, { recursive: true });
+  }
+});
+
+test("incremental queue append preserves existing entries and records only new tasks", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-history-append-"));
+  const store = new HistoryStore(path.join(root, "history.sqlite3"));
+  try {
+    store.recordQueueSnapshot("/repo", [{ id: "old", kind: "task", sourcePath: "/old.md", prompt: "Old", state: "running", queuedAt: "2026-10-03T00:00:00Z" }], "initial");
+    store.recordQueueAppend("/repo", [
+      { id: "new-1", kind: "task", sourcePath: "/new-1.md", prompt: "New one", state: "queued", queuedAt: "2026-10-03T00:01:00Z" },
+      { id: "new-2", kind: "task", sourcePath: "/new-2.md", prompt: "New two", state: "queued", queuedAt: "2026-10-03T00:01:00Z" }
+    ], 1);
+    const tasks = store.listTasks("/repo", 10);
+    assert.equal(tasks.length, 3);
+    assert.equal(tasks.find(item => item.id === "old")?.state, "running");
+    assert.equal(tasks.find(item => item.id === "new-1")?.state, "queued");
+    assert.equal(store.getTask("new-2")?.initial_prompt, "New two");
+  } finally {
+    store.close();
+    await fs.rm(root, { recursive: true });
+  }
+});
+
+test("incremental queue removal clears one entry and preserves the remaining queue", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-history-remove-"));
+  const store = new HistoryStore(path.join(root, "history.sqlite3"));
+  try {
+    store.recordQueueSnapshot("/repo", [
+      { id: "running", kind: "task", sourcePath: "/running.md", prompt: "Running", state: "running", queuedAt: "2026-10-03T00:00:00Z" },
+      { id: "remove", kind: "task", sourcePath: "/remove.md", prompt: "Remove", state: "queued", queuedAt: "2026-10-03T00:01:00Z" },
+      { id: "keep", kind: "task", sourcePath: "/keep.md", prompt: "Keep", state: "queued", queuedAt: "2026-10-03T00:02:00Z" }
+    ], "initial");
+    store.recordQueueRemove("/repo", "remove", 2);
+    const tasks = store.listTasks("/repo", 10);
+    assert.equal(tasks.find(item => item.id === "running")?.state, "running");
+    assert.equal(tasks.find(item => item.id === "remove")?.state, "cleared");
+    assert.equal(tasks.find(item => item.id === "keep")?.state, "queued");
+    assert.equal((store.getTask("remove")?.events as Array<{ event_type: string }>).some(event => event.event_type === "queue_remove"), true);
+  } finally {
+    store.close();
+    await fs.rm(root, { recursive: true });
+  }
+});

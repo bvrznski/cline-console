@@ -103,6 +103,33 @@
           "scope": "application",
           "description": "Seconds a Cline completion must remain terminal before the scanner evaluates it."
         },
+        "cline-console.taskScanner.completionConfidenceThreshold": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 90,
+          "scope": "application",
+          "description": "Minimum evidence-based completion confidence percentage that accepts a verification pass even when it made justified implementation changes."
+        },
+        "cline-console.taskScanner.maxCompletionVerificationRounds": {
+          "type": "number",
+          "minimum": 1,
+          "default": 3,
+          "scope": "application",
+          "description": "Maximum completion-verification requests before accepting a completion that has no explicit incomplete-work indicators, preventing endless verification loops."
+        },
+        "cline-console.taskScanner.cleanupTerminals": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "After successful queued tasks and before YOLO restarts, retry disposal of idle workspace shells and close clean task-opened workspace tabs. Preserve busy, dirty, unknown, and [keep]-prefixed resources."
+        },
+        "cline-console.taskScanner.sudoZenityPrompt": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Show a Zenity warning when a running queued task starts an interactive sudo command. Password entry remains exclusively in the VS Code terminal."
+        },
         "cline-console.taskScanner.interTaskDelaySeconds": {
           "type": "number",
           "minimum": 0,
@@ -115,6 +142,13 @@
           "default": true,
           "scope": "application",
           "description": "Keep a task active when its completion report or task progress declares unfinished work."
+        },
+        "cline-console.taskScanner.maxUnchangedCompletionCorrectionRounds": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5,
+          "scope": "application",
+          "description": "Maximum consecutive STOP correction rounds that may return another incomplete completion claim without detected implementation activity before the queue item fails. Implementation activity resets this streak."
         },
         "cline-console.taskScanner.detectTestTimeouts": {
           "type": "boolean",
@@ -133,6 +167,63 @@
           "default": true,
           "scope": "application",
           "description": "Require audit remediation to produce a durable post-remediation report with validation and residual risk."
+        },
+        "cline-console.taskScanner.verifyCompletionCriteria": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Require a final same-thread criteria verification; repeat it only when the verification pass makes implementation changes."
+        },
+        "cline-console.taskScanner.reflective": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "After a queued task completes, request a same-thread Markdown reflection about implementation difficulties, blockers, tradeoffs, and lessons; the response is also retained in history."
+        },
+        "cline-console.taskScanner.restartOnYoloFailure": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Ask the daemon to recycle the exact registered VS Code extension host and reopen its workspace after a detected YOLO MODE three-consecutive-mistakes failure; incidents and outcomes are recorded in SQLite."
+        },
+        "cline-console.taskScanner.detectStuckLoops": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Detect when the LLM makes repeated completion claims without implementation activity and send a control request to break out of the loop."
+        },
+        "cline-console.taskScanner.maxStuckLoopRounds": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3,
+          "scope": "application",
+          "description": "Maximum consecutive completion claims without implementation activity before triggering a stuck loop detection and correction message."
+        },
+        "cline-console.taskScanner.waitForLmStudio": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Hold queue recovery and new task dispatch after startup until the configured LM Studio TCP endpoint is accepting connections."
+        },
+        "cline-console.taskScanner.lmStudioHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "scope": "application",
+          "description": "Host used by the queue's LM Studio readiness gate."
+        },
+        "cline-console.taskScanner.lmStudioPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 1234,
+          "scope": "application",
+          "description": "TCP port used by the queue's LM Studio readiness gate."
+        },
+        "cline-console.taskScanner.singleQueuePerLmStudioModel": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Permit only one cline-console queue task per loaded LM Studio model. Resuming a competing owned task pauses its queue and presses Cancel in the running Cline thread without clearing that thread."
         }
       }
     }
@@ -145,6 +236,7 @@
     "verify:release": "npm test && npm audit && npm pack --dry-run && vsce ls --tree"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.0.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.6.0",
@@ -152,5 +244,9 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "string-width": "^4.2.3"
   }
 }

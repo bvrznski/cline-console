@@ -10,6 +10,38 @@ export function runtimeDirectory(configured = ""): string {
   return xdg ? path.join(xdg, "cline-console") : path.join(os.homedir(), ".cache", "cline-console");
 }
 
+export function queueStateDirectory(configured = ""): string {
+  if (configured) return path.resolve(configured);
+  const xdg = process.env.XDG_STATE_HOME;
+  const stateRoot = xdg ? path.resolve(xdg) : path.join(os.homedir(), ".local", "state");
+  return path.join(stateRoot, "cline-console", "queues");
+}
+
+export function queueStatePath(workspace: string, directory = queueStateDirectory()): string {
+  return path.join(directory, `queue-${workspaceId(workspace)}.json`);
+}
+
+export async function migrateRuntimeQueueState(runtimeFile: string, persistentFile: string): Promise<boolean> {
+  try {
+    await fs.access(persistentFile);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  let content: string;
+  try { content = await fs.readFile(runtimeFile, "utf8"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  await fs.mkdir(path.dirname(persistentFile), { recursive: true, mode: 0o700 });
+  await fs.chmod(path.dirname(persistentFile), 0o700);
+  const temporary = `${persistentFile}.${process.pid}.tmp`;
+  await fs.writeFile(temporary, content, { mode: 0o600 });
+  await fs.rename(temporary, persistentFile);
+  return true;
+}
+
 export function workspaceId(workspace: string): string {
   return createHash("sha256").update(path.resolve(workspace)).digest("hex").slice(0, 16);
 }
@@ -34,5 +66,21 @@ export async function registerWorkspace(directory: string, workspace: string): P
 }
 
 export async function unregisterWorkspace(directory: string, registration: WorkspaceRegistration): Promise<void> {
+  if (!await ownsWorkspaceRegistration(directory, registration)) return;
   await Promise.allSettled([fs.unlink(registrationPath(directory, registration.id)), fs.unlink(registration.socketPath)]);
+}
+
+export async function ownsWorkspaceRegistration(directory: string, registration: WorkspaceRegistration): Promise<boolean> {
+  try {
+    const current = JSON.parse(await fs.readFile(registrationPath(directory, registration.id), "utf8")) as Partial<WorkspaceRegistration>;
+    return current.protocolVersion === registration.protocolVersion
+      && current.id === registration.id
+      && current.workspace === registration.workspace
+      && current.socketPath === registration.socketPath
+      && current.pid === registration.pid
+      && current.registeredAt === registration.registeredAt;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return false;
+    throw error;
+  }
 }

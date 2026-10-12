@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import Database from "better-sqlite3";
 import { taskTitle } from "../common/task_title";
 
 export interface HistoryQueueItem {
@@ -10,6 +10,12 @@ export interface HistoryQueueItem {
   kind?: "task" | "message";
   sourcePath: string;
   prompt: string;
+  reflective?: boolean;
+  scopePath?: string;
+  reflectionRequested?: boolean;
+  completionVerificationRequested?: boolean;
+  completionVerificationRounds?: number;
+  userConfirmedCompletion?: boolean;
   targetSessionId?: string;
   resumeSessionId?: string;
   state: string;
@@ -20,8 +26,14 @@ export interface HistoryQueueItem {
   lastCompletionMarker?: string;
   lastRecoveryMarker?: string;
   lastFailureMarker?: string;
+  lastYoloRestartMarker?: string;
+  lastYoloRestartAt?: string;
+  yoloRestartCount?: number;
   lastTestTimeoutMarker?: string;
+  lastScopeViolationMarker?: string;
+  pendingRecoveryContinuation?: { kind: "context_overflow" | "task_failure"; marker: string; sessionId: string; message: string };
   incompleteCompletionClaims?: number;
+  unchangedCompletionCorrectionRounds?: number;
   error?: string;
 }
 
@@ -42,18 +54,33 @@ export function historyDatabasePath(): string {
 }
 
 export class HistoryStore {
-  private readonly database: DatabaseSync;
+  private readonly database: Database.Database;
 
   constructor(readonly file = historyDatabasePath()) {
     mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     chmodSync(path.dirname(file), 0o700);
-    this.database = new DatabaseSync(file);
-    this.database.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;");
+    // Electron's extension host may expose process.report.getReport() but return
+    // undefined. better-sqlite3's automatic libc probe then dereferences
+    // report.header before it ever opens the database. Supplying the packaged
+    // native binding explicitly bypasses that fragile probe.
+    this.database = new Database(file, { timeout: 5_000, fileMustExist: false, nativeBinding: packagedNativeBinding() });
+    this.database.pragma("foreign_keys = ON");
+    this.database.pragma("journal_mode = WAL");
+    this.database.pragma("synchronous = FULL");
+    this.database.pragma("busy_timeout = 5000");
+    this.database.pragma("wal_autocheckpoint = 1000");
+    this.database.pragma("journal_size_limit = 67108864");
     this.migrate();
+    const integrity = this.database.pragma("quick_check", { simple: true });
+    if (integrity !== "ok") { this.database.close(); throw new Error(`SQLite quick_check failed: ${String(integrity)}`); }
     chmodSync(file, 0o600);
   }
 
-  close(): void { this.database.close(); }
+  close(): void {
+    if (!this.database.open) return;
+    this.database.pragma("wal_checkpoint(PASSIVE)");
+    this.database.close();
+  }
 
   registerWorkspace(workspace: string, metadata: Record<string, unknown> = {}): string {
     const id = digest(workspace);
@@ -83,10 +110,73 @@ export class HistoryStore {
         const taskId = item.id;
         task.run(taskId, workspaceId, item.kind ?? "task", item.prompt, digest(item.prompt), taskTitle(item.prompt) ?? "(untitled)", item.sourcePath, origin(item.sourcePath), item.queuedAt || now, now);
         snapshot.run(`${taskId}:initial`, workspaceId, taskId, item.prompt, digest(item.prompt), Buffer.byteLength(item.prompt), item.sourcePath, item.queuedAt || now);
-        queue.run(item.id, workspaceId, taskId, item.kind ?? "task", item.state, position + 1, item.queuedAt, item.dispatchedAt ?? null, item.finishedAt ?? null, item.targetSessionId ?? null, item.resumeSessionId ?? null, item.sessionId ?? null, item.error ?? null, json({ lastCompletionMarker: item.lastCompletionMarker, lastRecoveryMarker: item.lastRecoveryMarker, lastFailureMarker: item.lastFailureMarker, lastTestTimeoutMarker: item.lastTestTimeoutMarker, incompleteCompletionClaims: item.incompleteCompletionClaims }), now);
+        queue.run(item.id, workspaceId, taskId, item.kind ?? "task", item.state, position + 1, item.queuedAt, item.dispatchedAt ?? null, item.finishedAt ?? null, item.targetSessionId ?? null, item.resumeSessionId ?? null, item.sessionId ?? null, item.error ?? null, json({ lastCompletionMarker: item.lastCompletionMarker, lastRecoveryMarker: item.lastRecoveryMarker, lastFailureMarker: item.lastFailureMarker, lastYoloRestartMarker: item.lastYoloRestartMarker, lastYoloRestartAt: item.lastYoloRestartAt, yoloRestartCount: item.yoloRestartCount, lastTestTimeoutMarker: item.lastTestTimeoutMarker, pendingRecoveryContinuation: item.pendingRecoveryContinuation, incompleteCompletionClaims: item.incompleteCompletionClaims, unchangedCompletionCorrectionRounds: item.unchangedCompletionCorrectionRounds, reflective: item.reflective, reflectionRequested: item.reflectionRequested, completionVerificationRequested: item.completionVerificationRequested, completionVerificationRounds: item.completionVerificationRounds, userConfirmedCompletion: item.userConfirmedCompletion }), now);
         if (item.dispatchedAt) run.run(`${item.id}:${item.dispatchedAt}`, taskId, workspaceId, 1, item.sessionId ?? item.resumeSessionId ?? null, item.state, item.dispatchedAt, item.finishedAt ?? null, item.error ?? null, json({ targetSessionId: item.targetSessionId }), now);
       }
       this.insertEvent(workspaceId, { type: "queue_snapshot", source: "cline-console", payload: { reason, itemCount: items.length, ...queueMetadata, items: items.map(item => ({ id: item.id, kind: item.kind ?? "task", state: item.state, sessionId: item.sessionId, sourcePath: item.sourcePath })) } }, now);
+      this.database.exec("COMMIT");
+    } catch (error) { this.database.exec("ROLLBACK"); throw error; }
+  }
+
+  /** Persist newly appended entries without rewriting every older queue task. */
+  recordQueueAppend(workspace: string, items: HistoryQueueItem[], positionOffset: number): void {
+    if (!items.length) return;
+    const workspaceId = this.registerWorkspace(workspace);
+    const now = new Date().toISOString();
+    const task = this.database.prepare(`INSERT INTO tasks(id, workspace_id, kind, initial_prompt, prompt_sha256, title, source_path, origin, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title=excluded.title, updated_at=excluded.updated_at, source_path=excluded.source_path`);
+    const queue = this.database.prepare(`INSERT INTO queue_entries(id, workspace_id, task_id, kind, state, position, queued_at, dispatched_at, finished_at, target_session_id, resume_session_id, cline_session_id, error, metadata_json, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET state=excluded.state, position=excluded.position, updated_at=excluded.updated_at`);
+    const snapshot = this.database.prepare(`INSERT OR IGNORE INTO prompt_snapshots(id, workspace_id, task_id, prompt_kind, content, sha256, byte_length, source, version, created_at, metadata_json)
+      VALUES (?, ?, ?, 'initial_task', ?, ?, ?, ?, NULL, ?, '{}')`);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      items.forEach((item, index) => {
+        const hash = digest(item.prompt);
+        task.run(item.id, workspaceId, item.kind ?? "task", item.prompt, hash, taskTitle(item.prompt) ?? "(untitled)", item.sourcePath, origin(item.sourcePath), item.queuedAt || now, now);
+        snapshot.run(`${item.id}:initial`, workspaceId, item.id, item.prompt, hash, Buffer.byteLength(item.prompt), item.sourcePath, item.queuedAt || now);
+        queue.run(item.id, workspaceId, item.id, item.kind ?? "task", item.state, positionOffset + index + 1, item.queuedAt, null, null, item.targetSessionId ?? null, item.resumeSessionId ?? null, null, null, json({ reflective: item.reflective }), now);
+      });
+      this.insertEvent(workspaceId, { type: "queue_append", source: "cline-console", payload: { itemCount: items.length, firstPosition: positionOffset + 1, itemIds: items.map(item => item.id) } }, now);
+      this.database.exec("COMMIT");
+    } catch (error) { this.database.exec("ROLLBACK"); throw error; }
+  }
+
+  /** Remove one waiting entry without rebuilding the complete queue snapshot. */
+  recordQueueRemove(workspace: string, itemId: string, removedPosition: number): void {
+    const workspaceId = this.registerWorkspace(workspace);
+    const now = new Date().toISOString();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database.prepare(`UPDATE queue_entries
+        SET state='cleared', position=NULL, updated_at=?
+        WHERE workspace_id=? AND id=? AND state='queued'`).run(now, workspaceId, itemId);
+      this.database.prepare(`UPDATE queue_entries
+        SET position=position-1, updated_at=?
+        WHERE workspace_id=? AND state IN ('queued','running') AND position>?`).run(now, workspaceId, removedPosition);
+      this.insertEvent(workspaceId, {
+        type: "queue_remove", source: "cline-console", queueItemId: itemId,
+        payload: { itemId, removedPosition }
+      }, now);
+      this.database.exec("COMMIT");
+    } catch (error) { this.database.exec("ROLLBACK"); throw error; }
+  }
+
+  /** Clear a queue suffix in one transaction and retain the first N active entries. */
+  recordQueueTrim(workspace: string, itemIds: string[], keep: number): void {
+    if (!itemIds.length) return;
+    const workspaceId = this.registerWorkspace(workspace);
+    const now = new Date().toISOString();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const clear = this.database.prepare(`UPDATE queue_entries
+        SET state='cleared', position=NULL, updated_at=?
+        WHERE workspace_id=? AND id=? AND state='queued'`);
+      for (const itemId of itemIds) clear.run(now, workspaceId, itemId);
+      this.insertEvent(workspaceId, {
+        type: "queue_trim", source: "cline-console",
+        payload: { keep, removed: itemIds.length, itemIds }
+      }, now);
       this.database.exec("COMMIT");
     } catch (error) { this.database.exec("ROLLBACK"); throw error; }
   }
@@ -156,3 +246,18 @@ export class HistoryStore {
 function digest(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 function json(value: unknown): string { return JSON.stringify(value, (_key, item) => item === undefined ? null : item); }
 function origin(sourcePath: string): string { return sourcePath.startsWith("cline-history:") ? "cline-history" : sourcePath === "<inline-or-stdin>" ? "inline" : "file"; }
+
+function packagedNativeBinding(): string {
+  const packageRoot = path.dirname(require.resolve("better-sqlite3/package.json"));
+  const platform = process.platform === "linux" && linuxUsesMusl() ? "linuxmusl" : process.platform;
+  return path.join(packageRoot, "prebuilds", `${platform}-${process.arch}.node`);
+}
+
+function linuxUsesMusl(): boolean {
+  if (process.platform !== "linux") return false;
+  const report = process.report?.getReport?.() as { header?: { glibcVersionRuntime?: string } } | undefined;
+  // An unavailable Electron diagnostic report is not evidence of musl. The
+  // extension targets ordinary desktop distributions, where glibc is the safe
+  // fallback; actual musl runtimes expose a report without glibcVersionRuntime.
+  return report !== undefined && report.header !== undefined && !report.header.glibcVersionRuntime;
+}

@@ -30,6 +30,7 @@ export interface ClineAdapter {
   newTask(prompt: string): Promise<TaskResult>;
   resumeTask?(taskId: string): Promise<TaskResult>;
   sendMessage(message: string): Promise<void>;
+  interruptTask(): Promise<void>;
   cancelTask(): Promise<void>;
   getStatus(): Promise<ClineStatus>;
 }

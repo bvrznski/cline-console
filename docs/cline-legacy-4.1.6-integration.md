@@ -23,7 +23,7 @@ Legacy activation returns the object built by minified symbol `vEc(controller)` 
 - `pressPrimaryButton()`
 - `pressSecondaryButton()`
 
-`startNewTask` calls `controller.clearTask()`, posts state, opens the Cline view, and calls `controller.initTask(prompt, images)`. `sendMessage` calls `controller.task.handleWebviewAskResponse("messageResponse", message, images)` when a task exists. These are public activation exports available through `vscode.extensions.getExtension("saoudrizwan.claude-dev").activate()`.
+`startNewTask` calls `controller.clearTask()`, posts state, opens the Cline view, and calls `controller.initTask(prompt, images)`. `sendMessage` calls `controller.task.handleWebviewAskResponse("messageResponse", message, images)` when a task exists. `pressSecondaryButton` calls `handleWebviewAskResponse("noButtonClicked", "", [])`, which is the in-task Cancel action and does not clear the displayed task. These are public activation exports available through `vscode.extensions.getExtension("saoudrizwan.claude-dev").activate()`.
 
 Before calling `startNewTask`, the adapter explicitly shows the sidebar, opens the contributed view container through VS Code's canonical `workbench.view.extension.<container-id>` command, focuses `<extension-name>.SidebarProvider`, and invokes Cline's own `cline.focusChatInput` command. For stable Cline the container and view commands resolve to `workbench.view.extension.claude-dev-ActivityBar` and `claude-dev.SidebarProvider.focus`. Cline's internal test helper uses the older `workbench.view.<container-id>` form, but that did not reveal a fully closed sidebar in the tested VS Code layout.
 
@@ -44,7 +44,8 @@ The terminal does not connect to workspace companions directly. A singleton `sys
 ## Chosen and rejected strategies
 
 - Chosen for new/follow-up: Strategy A, public activation API.
-- Chosen for cancel: Strategy B, registered `cline.plusButtonClicked`, because its handler uses Cline's normal `clearTask` path.
+- Chosen for explicit task clearing: Strategy B, registered `cline.plusButtonClicked`, because its handler uses Cline's normal `clearTask` path.
+- Chosen for queue-to-queue preemption: `pressSecondaryButton()`, because it presses Cancel inside the active thread and preserves that thread for same-thread resume.
 - Rejected: internal bundle imports. Minified symbols are unstable and a second `require` would not reliably expose the activated singleton.
 - Rejected: webview protocol injection. The public API reaches the same controller directly.
 - Rejected: clipboard, keyboard, Electron, browser, and standalone CLI automation.

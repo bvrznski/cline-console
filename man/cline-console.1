@@ -97,9 +97,24 @@ all registered workspaces are shown.
 .B queue add --file FILE...
 Append one or more files in supplied order.
 .TP
+.BI queue add " START_FILE - END"
+Append sibling files whose names share the start prefix and fall inclusively
+between the numeric suffixes. END may be an integer or prefixed name such as
+0.20. Extensions are optional on either side; for example,
+.B 0.12.md - 0.20
+selects
+.B 0.12.md
+through
+.BR 0.20.md .
+Missing numbers are skipped and the expanded list is printed before queuing.
+.TP
 .B queue add --dir DIRECTORY
 Append all regular files discovered recursively in deterministic relative-path
 order. Symbolic links are ignored.
+.TP
+.B queue add --from MANIFEST
+Append task files listed one path per line. Blank lines and comments beginning
+with # are ignored. Relative entries are resolved from the manifest directory.
 .TP
 .B queue add --dir DIRECTORY --newer-than REFERENCE_FILE
 Append only regular files whose modification time is strictly newer than the
@@ -111,6 +126,10 @@ Append the supplied batch and clear a persisted queue pause.
 .B queue replace --file FILE...
 Replace all waiting entries with the supplied batch. A genuinely active running
 entry is preserved.
+.TP
+.BI queue replace " START_FILE - END"
+Replace waiting entries using the same sibling-file numeric range rules as
+.BR queue add .
 .TP
 .B queue replace --dir DIRECTORY
 Replace waiting entries with the deterministically ordered directory contents.
@@ -127,12 +146,18 @@ Remove one waiting entry by exact displayed title. Ambiguous titles are rejected
 .B queue remove --id ID
 Remove one waiting entry by queue ID.
 .TP
+.B queue trim NUMBER
+Retain the first NUMBER active positions, counting a running head as position 1,
+and remove the remaining waiting suffix in one operation.
+.TP
 .B queue pause
 Allow the current task to finish, then prevent the next task from dispatching.
 The pause is persisted.
 .TP
 .B queue resume
-Clear the persisted pause and resume FIFO processing.
+Clear the persisted pause and resume FIFO processing. This is also an explicit
+execution override: when another workspace uses the same LM Studio model, its
+queue task is interrupted and this workspace takes over after the handoff delay.
 .TP
 .B queue clear [--force]
 Remove all waiting and running queue entries without changing Cline history.

@@ -3,7 +3,8 @@ import { ClineConsoleError } from "../common/errors";
 import { PROTOCOL_VERSION } from "../common/version";
 import type { Action, IpcRequest, IpcResponse } from "./types";
 
-export const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+export const MAX_MESSAGE_MIB = 512;
+export const MAX_MESSAGE_BYTES = MAX_MESSAGE_MIB * 1024 * 1024;
 
 export function makeRequest(action: Action, workspace: string, payload?: IpcRequest["payload"]): IpcRequest {
   return { protocolVersion: PROTOCOL_VERSION, requestId: randomUUID(), action, workspace, payload };
@@ -16,9 +17,12 @@ export function parseRequest(line: string): IpcRequest {
   const request = value as Partial<IpcRequest>;
   if (request.protocolVersion !== PROTOCOL_VERSION) throw new ClineConsoleError("PROTOCOL_MISMATCH", `Protocol version ${String(request.protocolVersion)} is unsupported.`);
   if (typeof request.requestId !== "string" || !request.requestId) throw new ClineConsoleError("INVALID_REQUEST", "requestId is required.");
-  if (!(["newTask", "reloadTask", "resumeHistoryTask", "finishUnfinishedTasks", "skipWaitingTask", "sendMessage", "cancelTask", "status", "capabilities", "enqueueTasks", "enqueueMessages", "replaceQueue", "clearQueue", "clearWorkspace", "popQueue", "pauseQueue", "resumeQueue", "queueStatus", "activity"] as unknown[]).includes(request.action)) throw new ClineConsoleError("INVALID_ACTION", "Unknown action.");
+  const action = request.action;
+  if (typeof action !== "string") throw new ClineConsoleError("INVALID_REQUEST", "action must be a string.");
+  const validActions: Action[] = ["newTask", "reloadTask", "resumeHistoryTask", "resumePreemptedQueueTask", "finishUnfinishedTasks", "confirmCompletion", "skipWaitingTask", "sendMessage", "cancelTask", "preemptQueueTask", "status", "capabilities", "enqueueTasks", "enqueueMessages", "replaceQueue", "clearQueue", "clearWorkspace", "popQueue", "trimQueue", "pauseQueue", "resumeQueue", "continueQueue", "relaunchQueue", "queueStatus", "enqueueContext", "activity", "ping"];
+  if (!validActions.includes(action)) throw new ClineConsoleError("INVALID_ACTION", `Unknown action: ${action}. Valid actions are: ${validActions.join(", ")}.`);
   if (typeof request.workspace !== "string" || !request.workspace) throw new ClineConsoleError("INVALID_WORKSPACE", "workspace is required.");
-  return request as IpcRequest;
+  return { protocolVersion: request.protocolVersion, requestId: request.requestId, action, workspace: request.workspace, payload: request.payload } as IpcRequest;
 }
 
 export function serializeResponse(response: IpcResponse): string { return `${JSON.stringify(response)}\n`; }

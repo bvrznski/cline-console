@@ -6,7 +6,7 @@ import test from "node:test";
 import { ClineConsoleError } from "../src/common/errors";
 import type { WorkspaceRegistration } from "../src/ipc/types";
 import { resolveWorkspace, loadRegistrations, parseWorkspaceSelection, waitForWorkspaceRegistration } from "../src/client/ipc_client";
-import { ensureRuntimeDirectory, registerWorkspace } from "../src/extension/workspace_registry";
+import { ensureRuntimeDirectory, migrateRuntimeQueueState, ownsWorkspaceRegistration, queueStateDirectory, queueStatePath, registerWorkspace, unregisterWorkspace, workspaceId } from "../src/extension/workspace_registry";
 
 const registration = (workspace: string, id: string): WorkspaceRegistration => ({ protocolVersion: 1, id, workspace, socketPath: `/tmp/${id}.sock`, pid: 1, registeredAt: new Date(0).toISOString() });
 
@@ -56,6 +56,22 @@ test("workspace registration wait bridges VS Code startup", async () => {
   await fs.rm(root, { recursive: true });
 });
 
+test("a stale extension host cannot unregister its successor", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-owner-"));
+  const workspace = path.join(root, "workspace"), runtime = path.join(root, "runtime");
+  await fs.mkdir(workspace);
+  const stale = await registerWorkspace(runtime, workspace);
+  await new Promise(resolve => setTimeout(resolve, 2));
+  const successor = await registerWorkspace(runtime, workspace);
+  assert.equal(await ownsWorkspaceRegistration(runtime, stale), false);
+  assert.equal(await ownsWorkspaceRegistration(runtime, successor), true);
+  await unregisterWorkspace(runtime, stale);
+  assert.equal(await ownsWorkspaceRegistration(runtime, successor), true);
+  await unregisterWorkspace(runtime, successor);
+  assert.equal(await ownsWorkspaceRegistration(runtime, successor), false);
+  await fs.rm(root, { recursive: true });
+});
+
 test("interactive workspace selection accepts a valid number, ID, or exact path", () => {
   const items = [registration("/one", "one"), registration("/two", "two")];
   assert.equal(parseWorkspaceSelection(items, "2")?.workspace, "/two");
@@ -68,4 +84,32 @@ test("interactive workspace selection rejects cancellation and invalid input", (
   assert.equal(parseWorkspaceSelection(items, ""), undefined);
   assert.equal(parseWorkspaceSelection(items, "3"), undefined);
   assert.equal(parseWorkspaceSelection(items, "missing"), undefined);
+});
+
+test("queue state uses persistent XDG state storage instead of the runtime directory", () => {
+  const previous = process.env.XDG_STATE_HOME;
+  process.env.XDG_STATE_HOME = "/state";
+  try {
+    assert.equal(queueStateDirectory(), path.join("/state", "cline-console", "queues"));
+    assert.equal(queueStatePath("/repo"), path.join("/state", "cline-console", "queues", `queue-${workspaceId("/repo")}.json`));
+  } finally {
+    if (previous === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previous;
+  }
+});
+
+test("runtime queue migration is private, atomic, and never overwrites persistent state", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-queue-migration-"));
+  const runtimeFile = path.join(root, "run", "queue.json");
+  const persistentFile = path.join(root, "state", "queues", "queue.json");
+  await fs.mkdir(path.dirname(runtimeFile), { recursive: true });
+  await fs.writeFile(runtimeFile, '{"source":"runtime"}');
+  assert.equal(await migrateRuntimeQueueState(runtimeFile, persistentFile), true);
+  assert.equal(await fs.readFile(persistentFile, "utf8"), '{"source":"runtime"}');
+  assert.equal((await fs.stat(persistentFile)).mode & 0o777, 0o600);
+  assert.equal((await fs.stat(path.dirname(persistentFile))).mode & 0o777, 0o700);
+  await fs.writeFile(runtimeFile, '{"source":"new-runtime"}');
+  assert.equal(await migrateRuntimeQueueState(runtimeFile, persistentFile), false);
+  assert.equal(await fs.readFile(persistentFile, "utf8"), '{"source":"runtime"}');
+  await fs.rm(root, { recursive: true });
 });

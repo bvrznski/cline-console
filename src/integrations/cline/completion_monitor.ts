@@ -6,26 +6,37 @@ import type { ClineStatus } from "./types";
 import { taskTitle } from "../../common/task_title";
 import { findLatestContextOverflow } from "./context_overflow";
 
-export interface CompletionResult { sessionId: string; status: string; exitCode?: number; errorText?: string; failureMarker?: string; testTimeoutMarker?: string; timedOutCommand?: string; completionText?: string; taskProgressText?: string; completionMarker?: string; recoveryMarker?: string; }
+export interface CompletionResult { sessionId: string; status: string; exitCode?: number; errorText?: string; failureMarker?: string; testTimeoutMarker?: string; timedOutCommand?: string; completionText?: string; taskProgressText?: string; completionMarker?: string; recoveryMarker?: string; scopeViolationMarker?: string; violatingPaths?: string[]; implementationActivity?: boolean; userConfirmedDoneMarker?: string; }
 export interface TaskCompletionMonitorOptions {
   deletionGraceMs?: number;
   pollIntervalMs?: number;
   terminalStabilityMs?: number;
   detectTestTimeouts?: boolean;
   knownSessionId?: string;
+  currentSessionId?: () => string | undefined;
   afterCompletionMarker?: string;
   afterRecoveryMarker?: string;
   afterFailureMarker?: string;
   afterTestTimeoutMarker?: string;
+  scopePath?: string;
+  afterScopeViolationMarker?: string;
   onSessionObserved?: (sessionId: string) => void | Promise<void>;
+  onActivityStatus?: (status: "running" | "waiting" | "completed", completionClaim: boolean) => void | Promise<void>;
 }
-export interface WorkspaceActivity { active: boolean; sessionId?: string; status?: "running" | "waiting" | "idle" | "completed" | "failed"; }
+export interface WorkspaceActivity { active: boolean; queueActive?: boolean; sessionId?: string; status?: "running" | "waiting" | "idle" | "completed" | "failed"; observedAt?: string; modelIdentity?: string; modelConflict?: { winnerWorkspace: string; modelIdentity: string; interruptedAt: string }; }
 export interface WorkspaceSessionStatus { sessionId: string; status: string; observedAt: string; title?: string; exitCode?: number; errorText?: string; }
 export interface WorkspaceTaskPrompt { sessionId: string; prompt: string; }
-export interface NewTaskHandoff { sessionId: string; marker: string; text?: string; }
+export interface NewTaskHandoff { sessionId: string; marker: string; text?: string; repeatCount: number; }
 export const BRIDGE_SUBMISSION_GRACE_MS = 30_000;
 export const UI_RUNNING_STALE_MS = 15 * 60_000;
-const SAME_THREAD_INSTRUCTION = /(?:finish|continue|remain|work)\s+(?:the\s+)?(?:current\s+)?(?:original\s+)?(?:task\s+)?in\s+this\s+(?:exact\s+)?(?:same\s+)?thread/i;
+export const MANUAL_COMPLETED_TASK_RESUME_GAP_MS = 5_000;
+export const SAME_THREAD_ACK_MARKER = "[cline-console:same-thread-handoff]";
+const SAME_THREAD_INSTRUCTION = /(?:finish|continue|remain|work)\s+(?:the\s+)?(?:current\s+)?(?:original\s+)?(?:task\s+)?in\s+this\s+(?:exact\s+)?(?:same\s+)?(?:Cline\s+)?thread/i;
+
+function isSameThreadAcknowledgement(message: Record<string, unknown>): boolean {
+  return typeof message.text === "string"
+    && (message.text.includes(SAME_THREAD_ACK_MARKER) || SAME_THREAD_INSTRUCTION.test(message.text));
+}
 
 export async function getLegacyNewTaskHandoff(workspace: string, vscodeStorageOverride?: string): Promise<NewTaskHandoff | undefined> {
   const storage = vscodeStorageOverride || process.env.CLINE_VSCODE_STORAGE_DIR?.trim() || path.join(os.homedir(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
@@ -51,13 +62,19 @@ export async function getLegacyNewTaskHandoff(workspace: string, vscodeStorageOv
         if (messages[index].ask === "new_task") { handoffIndex = index; break; }
       }
       if (handoffIndex < 0) continue;
-      const alreadyRejected = messages.slice(handoffIndex + 1).some(message => typeof message.text === "string" && SAME_THREAD_INSTRUCTION.test(message.text));
+      const alreadyRejected = messages.slice(handoffIndex + 1).some(isSameThreadAcknowledgement);
       if (alreadyRejected) continue;
       const handoff = messages[handoffIndex];
-      return { sessionId, marker: `${sessionId}:${String(handoff.ts ?? handoffIndex)}`, ...(typeof handoff.text === "string" ? { text: handoff.text } : {}) };
+      const normalizedText = normalizeHandoffText(handoff.text);
+      const repeatCount = messages.filter(message => message.ask === "new_task" && normalizeHandoffText(message.text) === normalizedText).length;
+      return { sessionId, marker: `${sessionId}:${String(handoff.ts ?? handoffIndex)}`, repeatCount, ...(typeof handoff.text === "string" ? { text: handoff.text } : {}) };
     }
     return undefined;
   } catch { return undefined; }
+}
+
+function normalizeHandoffText(value: unknown): string {
+  return typeof value === "string" ? value.toLocaleLowerCase().replace(/\s+/g, " ").trim() : "";
 }
 
 export async function waitForLegacyNewTaskHandoffAcknowledgement(handoff: NewTaskHandoff, signal: AbortSignal, vscodeStorageOverride?: string, timeoutMs = 10_000): Promise<boolean> {
@@ -68,7 +85,7 @@ export async function waitForLegacyNewTaskHandoffAcknowledgement(handoff: NewTas
     try {
       const messages = JSON.parse(await fs.readFile(file, "utf8")) as Array<Record<string, unknown>>;
       const handoffIndex = messages.findIndex((message, index) => message.ask === "new_task" && `${handoff.sessionId}:${String(message.ts ?? index)}` === handoff.marker);
-      if (handoffIndex >= 0 && messages.slice(handoffIndex + 1).some(message => typeof message.text === "string" && SAME_THREAD_INSTRUCTION.test(message.text))) return true;
+      if (handoffIndex >= 0 && messages.slice(handoffIndex + 1).some(isSameThreadAcknowledgement)) return true;
     } catch { /* The UI message file may be updating atomically. */ }
     await abortableDelay(Math.min(250, Math.max(0, deadline - Date.now())), signal);
   }
@@ -129,7 +146,21 @@ async function getLegacyUiTaskStatus(workspace: string, storage: string): Promis
     const last = messages.at(-1);
     if (!last) return undefined;
     const failure = findUnresolvedTaskFailure(messages, sessionId);
-    const terminal = last.ask === "completion_result" || last.say === "completion_result";
+    // Cline may append resume_completed_task immediately while leaving a
+    // completed thread. A substantially later, fresh control is different: it
+    // records that the user manually reopened that exact thread. Treat that as
+    // a model-acquisition signal so the cross-workspace arbiter can suspend a
+    // competing queue before both workspaces submit inference concurrently.
+    const previousCompletion = last.ask === "resume_completed_task"
+      ? [...messages].reverse().find(message => message !== last && (message.ask === "completion_result" || message.say === "completion_result"))
+      : undefined;
+    const resumeAt = typeof last.ts === "number" ? last.ts : Number.NaN;
+    const completionAt = typeof previousCompletion?.ts === "number" ? previousCompletion.ts : Number.NaN;
+    const delayedCompletedTaskResume = last.ask === "resume_completed_task"
+      && Number.isFinite(resumeAt)
+      && Number.isFinite(completionAt)
+      && resumeAt - completionAt >= MANUAL_COMPLETED_TASK_RESUME_GAP_MS;
+    const terminal = last.ask === "completion_result" || last.say === "completion_result" || (last.ask === "resume_completed_task" && !delayedCompletedTaskResume);
     const waiting = last.ask === "resume_task";
     const staleRunning = !failure && !terminal && !waiting && Date.now() - metadata.mtimeMs > UI_RUNNING_STALE_MS;
     return { sessionId, status: failure ? "failed" : terminal ? "completed" : waiting ? "waiting" : staleRunning ? "stale" : "running", observedAt: metadata.mtime.toISOString(), title: taskTitle(entry.task), ...(failure ? { errorText: failure.text } : {}) };
@@ -159,7 +190,55 @@ export function reconcileLegacyStatus(status: ClineStatus, session: WorkspaceSes
 export async function getLegacyWorkspaceActivity(workspace: string, clineRootOverride?: string, vscodeStorageOverride?: string): Promise<WorkspaceActivity> {
   const session = await getLegacyWorkspaceSessionStatus(workspace, clineRootOverride, vscodeStorageOverride);
   if (!session || !(["running", "waiting", "idle", "completed", "failed"] as string[]).includes(session.status)) return { active: false };
-  return { active: true, sessionId: session.sessionId, status: session.status as WorkspaceActivity["status"] };
+  return { active: true, sessionId: session.sessionId, status: session.status as WorkspaceActivity["status"], observedAt: session.observedAt };
+}
+
+/**
+ * Resolve live activity from sessions already owned by a workspace queue.
+ *
+ * Cline can temporarily omit a newly created/recovered task from its shared
+ * taskHistory.json while continuing to update that task's UI transcript.  A
+ * queue already has stronger attribution: its durable owned session IDs and
+ * the exact prompt of its running item.  Use those two facts to keep model
+ * arbitration accurate without ever adopting an unrelated Cline task.
+ */
+export async function getOwnedLegacyTaskActivity(
+  sessionIds: readonly string[],
+  prompt: string,
+  vscodeStorageOverride?: string,
+  observedAfter?: string
+): Promise<WorkspaceActivity | undefined> {
+  const storage = vscodeStorageOverride || process.env.CLINE_VSCODE_STORAGE_DIR?.trim() || path.join(os.homedir(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
+  const candidates: Array<WorkspaceActivity & { modifiedAt: number }> = [];
+  const observedAfterMs = observedAfter ? Date.parse(observedAfter) : Number.NaN;
+  for (const sessionId of [...new Set(sessionIds)].slice(-200)) {
+    const file = path.join(storage, "tasks", sessionId, "ui_messages.json");
+    try {
+      const [raw, metadata] = await Promise.all([fs.readFile(file, "utf8"), fs.stat(file)]);
+      if (Number.isFinite(observedAfterMs) && metadata.mtimeMs < observedAfterMs) continue;
+      const messages = JSON.parse(raw) as Array<Record<string, unknown>>;
+      const taskMessage = messages.find(message => message.say === "task" && typeof message.text === "string");
+      if (taskMessage?.text !== prompt) continue;
+      const last = messages.at(-1);
+      if (!last) continue;
+      const failure = findUnresolvedTaskFailure(messages, sessionId);
+      const completed = last.ask === "completion_result" || last.say === "completion_result";
+      const waiting = last.ask === "resume_task";
+      const staleRunning = !failure && !completed && !waiting && Date.now() - metadata.mtimeMs > UI_RUNNING_STALE_MS;
+      candidates.push({
+        active: !staleRunning,
+        sessionId,
+        status: failure ? "failed" : completed ? "completed" : waiting ? "waiting" : staleRunning ? "idle" : "running",
+        observedAt: metadata.mtime.toISOString(),
+        modifiedAt: metadata.mtimeMs
+      });
+    } catch { /* An owned session may have been pruned or atomically rewritten. */ }
+  }
+  candidates.sort((left, right) => right.modifiedAt - left.modifiedAt);
+  const selected = candidates[0];
+  if (!selected) return undefined;
+  const { modifiedAt: _modifiedAt, ...activity } = selected;
+  return activity;
 }
 
 export async function waitForLegacyMessageCompletion(workspace: string, sessionId: string, signal: AbortSignal, logger: Logger, clineRootOverride?: string): Promise<CompletionResult> {
@@ -195,7 +274,12 @@ export async function waitForLegacyWorkspaceIdle(workspace: string, signal: Abor
   while (!signal.aborted) {
     const current = await getLegacyWorkspaceSessionStatus(workspace, clineRootOverride, vscodeStorageOverride);
     if (current?.status !== "running" && current?.status !== "waiting") return;
-    if (current.status === "waiting" && isWaitingTaskIgnored(current.sessionId)) return;
+    // A queue-owned session can remain reported as `running` by Cline's
+    // workspace metadata after the completion monitor has already accepted
+    // and persisted its terminal result.  The queue supplies only explicitly
+    // finalized/overridden session IDs here, so allow either stale busy state
+    // to be ignored instead of blocking the next item forever.
+    if (isWaitingTaskIgnored(current.sessionId)) return;
     if (!announced) { logger.info(`Queue waiting for existing Cline session ${current.sessionId} in ${workspace}.`); announced = true; }
     await abortableDelay(5_000, signal);
   }
@@ -204,24 +288,58 @@ export async function waitForLegacyWorkspaceIdle(workspace: string, signal: Abor
   // inherit an expected monitor cancellation as an INTERNAL_ERROR.
 }
 
+export async function waitForLegacyWorkspaceIdleStability(workspace: string, stabilityMs: number, signal: AbortSignal, logger: Logger, clineRootOverride?: string, isWaitingTaskIgnored: (sessionId: string) => boolean = () => false, vscodeStorageOverride?: string, pollIntervalMs = 1_000): Promise<void> {
+  let idleSince: number | undefined;
+  let announced = false;
+  while (!signal.aborted) {
+    const current = await getLegacyWorkspaceSessionStatus(workspace, clineRootOverride, vscodeStorageOverride);
+    const busy = current !== undefined
+      && (current.status === "running" || current.status === "waiting")
+      && !isWaitingTaskIgnored(current.sessionId);
+    if (busy) {
+      idleSince = undefined;
+      if (!announced) { logger.info(`Restart recovery is waiting for Cline session ${current!.sessionId} in ${workspace} to become idle.`); announced = true; }
+    } else {
+      idleSince ??= Date.now();
+      if (Date.now() - idleSince >= stabilityMs) return;
+    }
+    await abortableDelay(Math.min(pollIntervalMs, Math.max(1, stabilityMs)), signal);
+  }
+}
+
 export async function waitForLegacyTaskCompletion(workspace: string, prompt: string, dispatchedAt: string, signal: AbortSignal, logger: Logger, clineRootOverride?: string, vscodeStorageOverride?: string, options: TaskCompletionMonitorOptions = {}): Promise<CompletionResult> {
   const clineRoot = clineRootOverride || process.env.CLINE_DIR?.trim() || path.join(os.homedir(), ".cline");
   const vscodeStorage = vscodeStorageOverride || process.env.CLINE_VSCODE_STORAGE_DIR?.trim() || path.join(os.homedir(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
   const sessions = path.join(clineRoot, "data", "sessions");
   const earliest = Date.parse(dispatchedAt) - 5_000;
-  const deletionDeadline = Date.now() + (options.deletionGraceMs ?? 15_000);
+  const deletionGraceMs = options.deletionGraceMs ?? 15_000;
+  let deletionDeadline = Date.now() + deletionGraceMs;
   const pollIntervalMs = options.pollIntervalMs ?? 5_000;
   const terminalStabilityMs = options.terminalStabilityMs ?? 15_000;
   let observedUiSessionId = options.knownSessionId;
   let terminalCandidate: { key: string; firstObservedAt: number; result: CompletionResult } | undefined;
   while (!signal.aborted) {
-    const uiLookup = await findMatchingUiTask(vscodeStorage, workspace, prompt, earliest, observedUiSessionId, options.afterRecoveryMarker, options.afterFailureMarker, options.afterTestTimeoutMarker, options.detectTestTimeouts ?? true);
+    const currentSessionId = options.currentSessionId?.();
+    if (currentSessionId && currentSessionId !== observedUiSessionId) {
+      logger.info(`Cline completion monitor adopted session ${currentSessionId} from ${observedUiSessionId ?? "unbound"}.`);
+      observedUiSessionId = currentSessionId;
+      terminalCandidate = undefined;
+      deletionDeadline = Date.now() + deletionGraceMs;
+    }
+    const uiLookup = await findMatchingUiTask(vscodeStorage, workspace, prompt, earliest, observedUiSessionId, options.afterCompletionMarker, options.afterRecoveryMarker, options.afterFailureMarker, options.afterTestTimeoutMarker, options.detectTestTimeouts ?? true);
     const uiMatch = uiLookup.match;
     if (uiMatch && uiMatch.sessionId !== observedUiSessionId) {
       observedUiSessionId = uiMatch.sessionId;
       await options.onSessionObserved?.(uiMatch.sessionId);
     }
-    if (uiMatch?.status === "context_overflow" || uiMatch?.status === "task_failed" || uiMatch?.status === "test_timeout") return uiMatch;
+    if (uiMatch?.status === "context_overflow" || uiMatch?.status === "task_failed" || uiMatch?.status === "test_timeout" || uiMatch?.status === "user_confirmed_done") return uiMatch;
+    if (uiMatch && (uiMatch.status === "running" || uiMatch.status === "waiting" || uiMatch.status === "completed")) {
+      await options.onActivityStatus?.(uiMatch.status, Boolean(uiMatch.completionMarker));
+    }
+    if (observedUiSessionId && options.scopePath) {
+      const violation = await findScopeViolation(vscodeStorage, observedUiSessionId, workspace, options.scopePath, Date.parse(dispatchedAt));
+      if (violation && violation.scopeViolationMarker !== options.afterScopeViolationMarker) return violation;
+    }
     if (uiMatch) {
       if (uiMatch.status === "running" || uiMatch.status === "waiting" || uiMatch.completionMarker === options.afterCompletionMarker) terminalCandidate = undefined;
       else {
@@ -255,6 +373,21 @@ export async function waitForLegacyTaskCompletion(workspace: string, prompt: str
   throw new Error("Queue monitor stopped.");
 }
 
+async function findScopeViolation(storage: string, sessionId: string, workspace: string, scopePath: string, dispatchedAt: number): Promise<CompletionResult | undefined> {
+  try {
+    const metadata = JSON.parse(await fs.readFile(path.join(storage, "tasks", sessionId, "task_metadata.json"), "utf8")) as { files_in_context?: Array<Record<string, unknown>> };
+    const scope = path.resolve(scopePath);
+    const violatingPaths = [...new Set((metadata.files_in_context ?? []).flatMap(record => {
+      const editedAt = typeof record.cline_edit_date === "number" ? record.cline_edit_date : undefined;
+      if (!editedAt || editedAt < dispatchedAt || typeof record.path !== "string") return [];
+      const candidate = path.resolve(workspace, record.path);
+      return candidate === scope || candidate.startsWith(`${scope}${path.sep}`) ? [] : [candidate];
+    }))].sort();
+    if (!violatingPaths.length) return undefined;
+    return { sessionId, status: "scope_violation", violatingPaths, scopeViolationMarker: `${sessionId}:${violatingPaths.join("\0")}` };
+  } catch { return undefined; }
+}
+
 function isTerminalStatus(status: string): boolean {
   return status === "completed" || status === "idle" || status === "failed";
 }
@@ -266,17 +399,44 @@ function updateTerminalCandidate(candidate: { key: string; firstObservedAt: numb
   return { key, firstObservedAt: Date.now(), result };
 }
 
-async function findMatchingUiTask(storage: string, workspace: string, prompt: string, earliest: number, knownSessionId?: string, afterRecoveryMarker?: string, afterFailureMarker?: string, afterTestTimeoutMarker?: string, detectTestTimeouts = true): Promise<{ historyAvailable: boolean; match?: CompletionResult }> {
+async function findMatchingUiTask(storage: string, workspace: string, prompt: string, earliest: number, knownSessionId?: string, afterCompletionMarker?: string, afterRecoveryMarker?: string, afterFailureMarker?: string, afterTestTimeoutMarker?: string, detectTestTimeouts = true): Promise<{ historyAvailable: boolean; match?: CompletionResult }> {
   try {
     const history = JSON.parse(await fs.readFile(path.join(storage, "state", "taskHistory.json"), "utf8")) as Array<Record<string, unknown>>;
-    const entry = [...history].reverse().find(item => item.cwdOnTaskInitialization === workspace && typeof item.id === "string" && (
-      knownSessionId ? item.id === knownSessionId : item.task === prompt && Number(item.id) >= earliest
-    ));
+    const workspaceEntries = history.filter(item => item.cwdOnTaskInitialization === workspace && typeof item.id === "string");
+    const knownEntry = knownSessionId ? workspaceEntries.find(item => item.id === knownSessionId) : undefined;
+    const recoveredSuccessor = knownSessionId && (afterFailureMarker || afterRecoveryMarker)
+      ? [...workspaceEntries].reverse().find(item => item.task === prompt && Number(item.id) > Number(knownSessionId) && Number(item.id) >= earliest)
+      : undefined;
+    // Cline may replace a failed/compacted task with a new session while
+    // preserving the original prompt. Once recovery is known, follow that
+    // newer exact-workspace, exact-prompt session instead of remaining pinned
+    // forever to the terminal predecessor.
+    let entry = recoveredSuccessor ?? knownEntry ?? (!knownSessionId
+      ? [...workspaceEntries].reverse().find(item => item.task === prompt && Number(item.id) >= earliest)
+      : undefined);
+    let messages: Array<Record<string, unknown>> | undefined;
+    // taskHistory.json is shared by every VS Code workspace and Cline can
+    // transiently rewrite it while another window starts a task.  A queued
+    // task's own UI transcript is stronger identity evidence than absence from
+    // that index.  Continue monitoring the known task when its transcript
+    // still begins with the exact queued prompt; otherwise the queue can race
+    // ahead and launch later items in parallel.
+    if (!entry && knownSessionId) {
+      try {
+        messages = JSON.parse(await fs.readFile(path.join(storage, "tasks", knownSessionId, "ui_messages.json"), "utf8")) as Array<Record<string, unknown>>;
+        const taskMessage = messages.find(message => message.say === "task" && typeof message.text === "string");
+        if (taskMessage?.text === prompt) entry = { id: knownSessionId, cwdOnTaskInitialization: workspace, task: prompt };
+      } catch { /* A genuinely deleted task has no surviving transcript. */ }
+    }
     if (!entry) return { historyAvailable: true };
     const sessionId = String(entry.id);
-    const messages = JSON.parse(await fs.readFile(path.join(storage, "tasks", sessionId, "ui_messages.json"), "utf8")) as Array<Record<string, unknown>>;
+    messages ??= JSON.parse(await fs.readFile(path.join(storage, "tasks", sessionId, "ui_messages.json"), "utf8")) as Array<Record<string, unknown>>;
     const last = messages.at(-1);
     if (!last) return { historyAvailable: true };
+    const userConfirmedDone = findUserConfirmedDone(messages, sessionId, earliest);
+    if (userConfirmedDone) {
+      return { historyAvailable: true, match: { sessionId, status: "user_confirmed_done", userConfirmedDoneMarker: userConfirmedDone } };
+    }
     const overflow = findLatestContextOverflow(messages, sessionId);
     if (overflow && overflow.marker !== afterRecoveryMarker) {
       return { historyAvailable: true, match: { sessionId, status: "context_overflow", recoveryMarker: overflow.marker } };
@@ -285,7 +445,9 @@ async function findMatchingUiTask(storage: string, workspace: string, prompt: st
     if (failure && failure.marker !== afterFailureMarker) {
       return { historyAvailable: true, match: { sessionId, status: "task_failed", errorText: failure.text, failureMarker: failure.marker } };
     }
-    const completed = last.ask === "completion_result" || last.say === "completion_result";
+    // A resume_completed_task control is written after completion_result and
+    // must still drive the normal completion scanner/follow-up flow.
+    const completed = last.ask === "completion_result" || last.say === "completion_result" || last.ask === "resume_completed_task";
     const waiting = last.ask === "resume_task";
     const testTimeout = completed && detectTestTimeouts ? findUnresolvedTestTimeout(messages, sessionId, String(last.ts ?? messages.length)) : undefined;
     if (testTimeout) {
@@ -293,7 +455,9 @@ async function findMatchingUiTask(storage: string, workspace: string, prompt: st
       return { historyAvailable: true, match: { sessionId, status: "waiting" } };
     }
     const completion = completed ? [...messages].reverse().find(message =>
-      (message.ask === "completion_result" || message.say === "completion_result") && typeof message.text === "string"
+      (message.ask === "completion_result" || message.say === "completion_result")
+        && typeof message.text === "string"
+        && message.text.trim().length > 0
     ) : undefined;
     const taskProgress = completed ? [...messages].reverse().find(message =>
       (message.ask === "task_progress" || message.say === "task_progress") && typeof message.text === "string"
@@ -303,10 +467,58 @@ async function findMatchingUiTask(storage: string, workspace: string, prompt: st
       sessionId,
       status: completed ? "completed" : waiting ? "waiting" : "running",
       ...(completed ? { completionMarker: `${sessionId}:${markerPart}` } : {}),
+      ...(completed && afterCompletionMarker ? { implementationActivity: hasImplementationActivitySince(messages, afterCompletionMarker) } : {}),
       ...(typeof completion?.text === "string" ? { completionText: completion.text } : {}),
       ...(typeof taskProgress?.text === "string" ? { taskProgressText: taskProgress.text } : {})
     } };
   } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { historyAvailable: false }; return { historyAvailable: false }; }
+}
+
+export function findUserConfirmedDone(messages: Array<Record<string, unknown>>, sessionId: string, earliest = Number.NEGATIVE_INFINITY): string | undefined {
+  const match = [...messages].reverse().find(message => {
+    const timestamp = typeof message.ts === "number" ? message.ts : Number(message.ts);
+    return message.say === "user_feedback"
+      && typeof message.text === "string"
+      && message.text.trim().toUpperCase() === "DONE"
+      && Number.isFinite(timestamp)
+      && timestamp >= earliest;
+  });
+  return match ? `${sessionId}:${String(match.ts)}` : undefined;
+}
+
+export function hasImplementationActivitySince(messages: Array<Record<string, unknown>>, completionMarker: string): boolean {
+  const markerPart = completionMarker.slice(completionMarker.lastIndexOf(":") + 1);
+  const markerTimestamp = Number(markerPart);
+  let markerIndex = -1;
+  if (Number.isFinite(markerTimestamp)) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (Number(messages[index].ts) <= markerTimestamp) { markerIndex = index; break; }
+    }
+    if (markerIndex < 0 && Number.isSafeInteger(markerTimestamp) && markerTimestamp >= 1 && markerTimestamp <= messages.length) markerIndex = markerTimestamp - 1;
+  }
+  return messages.slice(markerIndex + 1).some(message => {
+    const text = typeof message.text === "string" ? message.text : "";
+    if (/\[(?:write_to_file|replace_in_file|apply_diff|search_and_replace|insert_content|apply_patch)\b/i.test(text)) return true;
+    const rawCommand = extractExecutedCommand(text);
+    // Exclude only cleanup of the exact directory configured by this CMake
+    // command. Keep all other mutations in the chain visible to the detector.
+    const command = rawCommand
+      ?.replace(/\brm\s+-rf\s+(build|cpp\/build)\s*&&(?=[^\n]*\bcmake\s+-S\s+\S+\s+-B\s+\1(?:\s|$))/g, "")
+      .replace(/\brm\s+-rf\s+(\/[^\s;&|]+)\/build\s*&&\s*cd\s+\1\s+&&\s*(cmake\s+-S\s+\.\s+-B\s+build)(?=\s|$)/g, "cd $1 && $2");
+    const normalized = command === undefined ? undefined : omitCompilerOutputCleanup(command);
+    return normalized !== undefined && /(?:^|[;&|]\s*)(?:apply_patch\b|sed\b[^\n;&|]*\s-i(?:\s|$)|perl\b[^\n;&|]*\s-pi(?:\s|$)|(?:cp|mv|rm|mkdir|touch|install)\b|(?:npm|pnpm|yarn)\s+(?:install|add|remove)\b|(?:apt|apt-get|dnf|yum|pacman)\b|git\s+(?:add|commit|mv|rm|apply)\b)/i.test(normalized);
+  });
+}
+
+function omitCompilerOutputCleanup(command: string): string {
+  const outputs = new Set([...command.matchAll(/(?:^|[;&|]\s*)(?:g\+\+|clang\+\+|gcc|clang|cc|c\+\+)(?=\s)[^\n;&|]*?\s-o\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gi)]
+    .map(match => match[1] ?? match[2] ?? match[3]).filter(Boolean));
+  let normalized = command;
+  for (const output of outputs) {
+    const escaped = output.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    normalized = normalized.replace(new RegExp(`(?:^|[;&|]\\s*)rm\\s+(?:-[a-zA-Z]*f[a-zA-Z]*\\s+)?(?:--\\s+)?(?:"${escaped}"|'${escaped}'|${escaped})(?=\\s*(?:$|[;&|]))`, "g"), "");
+  }
+  return normalized;
 }
 
 export function findUnresolvedTestTimeout(messages: Array<Record<string, unknown>>, sessionId: string, completionPart = "completion"): { marker: string; command: string; text: string } | undefined {

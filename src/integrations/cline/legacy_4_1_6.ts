@@ -90,6 +90,15 @@ export class LegacyCline416Adapter implements ClineAdapter {
     this.task = "active"; this.lastState = "submitted"; this.observedAt = new Date().toISOString();
   }
 
+  async interruptTask(): Promise<void> {
+    const api = await this.activate();
+    if (!api.pressSecondaryButton) {
+      throw new ClineConsoleError("CLINE_API_UNSUPPORTED", "Cline does not expose its in-task secondary-button action. Refusing to clear the task while interrupting it.");
+    }
+    await api.pressSecondaryButton();
+    this.task = "active"; this.lastState = "cancelled"; this.observedAt = new Date().toISOString();
+  }
+
   async cancelTask(): Promise<void> {
     const extension = discoverCline();
     if (!extension) throw new ClineConsoleError("CLINE_NOT_INSTALLED", "Cline is not installed or is disabled.");

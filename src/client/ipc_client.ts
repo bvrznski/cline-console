@@ -6,6 +6,9 @@ import { requestOverSocket } from "../ipc/transport";
 import type { Action, IpcRequest, WorkspaceRegistration } from "../ipc/types";
 import { runtimeDirectory } from "../extension/workspace_registry";
 
+// Import hangup detection functions
+import { detectExtensionHangup, restartExtension } from "../extension/hangup_detector";
+
 export async function loadRegistrations(directory = runtimeDirectory()): Promise<WorkspaceRegistration[]> {
   let names: string[];
   try { names = await fs.readdir(directory); } catch (error) {
@@ -82,9 +85,62 @@ async function findByRealPath(registrations: WorkspaceRegistration[], wanted: st
   return undefined;
 }
 
+/**
+ * Maximum number of auto-restart attempts
+ */
+const MAX_AUTO_RESTART_ATTEMPTS = 1;
+const SERVICE_REQUEST_TIMEOUT_MS = 35_000;
+const HANGUP_PING_TIMEOUT_MS = 1_500;
+
 export async function invoke(registration: WorkspaceRegistration, action: Action, payload?: IpcRequest["payload"]): Promise<unknown> {
   const serviceSocket = path.join(runtimeDirectory(), "service.sock");
-  const response = await requestOverSocket(serviceSocket, makeRequest(action, registration.workspace, payload));
-  if (!response.ok) throw new ClineConsoleError(response.error?.code ?? "REMOTE_ERROR", response.error?.message ?? "Unknown VS Code extension error.");
-  return response.result;
+
+  try {
+    // The daemon allows the workspace companion up to 30 seconds to answer.
+    // Keep the outer client deadline slightly longer so a slow operation is not
+    // misclassified as a hung extension while the daemon is still processing it.
+    const response = await requestOverSocket(serviceSocket, makeRequest(action, registration.workspace, payload), SERVICE_REQUEST_TIMEOUT_MS);
+    if (!response.ok) throw new ClineConsoleError(response.error?.code ?? "REMOTE_ERROR", response.error?.message ?? "Unknown VS Code extension error.");
+    return response.result;
+  } catch (error: unknown) {
+    // Check if this is a hangup situation
+    const isTimeout = error instanceof ClineConsoleError && ((error as ClineConsoleError).code === "TIMEOUT" || (error as ClineConsoleError).code === "RESPONSE_TOO_LARGE" || (error as ClineConsoleError).code === "MALFORMED_RESPONSE");
+
+    // Service-routed recovery commands may intentionally have no live
+    // workspace registration yet. Never treat their synthetic target as an
+    // extension host PID or attempt to signal the CLI process itself.
+    if (registration.socketPath && (isTimeout || (error as Error).message?.includes("Timed out"))) {
+      console.error(`Extension appears hung. Attempting to detect and restart...`);
+
+      // Try to ping the extension
+      const isHung = await detectExtensionHangup(registration, {
+        pingTimeoutMs: HANGUP_PING_TIMEOUT_MS,
+        maxConsecutiveFailures: 2
+      });
+
+      if (isHung.hung) {
+        console.error(`Extension hangup detected: ${isHung.reason}`);
+
+        // Auto-restart the extension
+        try {
+          await restartExtension(registration);
+
+          // Wait a moment for the extension to restart
+          await new Promise(resolve => setTimeout(resolve, 2000));
+
+          // Try the original request again after restart
+          const response = await requestOverSocket(serviceSocket, makeRequest(action, registration.workspace, payload), SERVICE_REQUEST_TIMEOUT_MS);
+          if (!response.ok) throw new ClineConsoleError(response.error?.code ?? "REMOTE_ERROR", response.error?.message ?? "Unknown VS Code extension error.");
+          return response.result;
+        } catch (restartError) {
+          console.error(`Failed to restart extension: ${(restartError as Error).message}`);
+          // Throw original timeout error
+          throw new ClineConsoleError("EXTENSION_TIMEOUT", `VS Code extension did not respond after auto-restart attempt`);
+        }
+      }
+    }
+
+    // Re-throw if not a hangup situation or auto-restart failed
+    throw error;
+  }
 }
