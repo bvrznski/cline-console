@@ -3,7 +3,7 @@ import net from "node:net";
 import path from "node:path";
 import { ClineConsoleError, errorMessage } from "../common/errors";
 import type { Logger } from "../common/logging";
-import { MAX_MESSAGE_BYTES, MAX_MESSAGE_MIB, parseRequest, serializeResponse } from "../ipc/protocol";
+import { DEFAULT_IPC_REQUEST_TIMEOUT_MS, ipcRequestTimeout, MAX_MESSAGE_BYTES, MAX_MESSAGE_MIB, parseRequest, serializeResponse } from "../ipc/protocol";
 import type { IpcRequest, IpcResponse, QueueStatus, WorkspaceRegistration } from "../ipc/types";
 import type { ClineAdapter } from "../integrations/cline/types";
 import type { TaskQueue } from "./task_queue";
@@ -56,7 +56,7 @@ export class IpcServer {
   }
 
   private handleConnection(socket: net.Socket): void {
-    socket.setTimeout(30_000, () => socket.destroy());
+    socket.setTimeout(DEFAULT_IPC_REQUEST_TIMEOUT_MS, () => socket.destroy());
     let data = Buffer.alloc(0), handled = false;
     socket.on("data", chunk => {
       if (handled) return;
@@ -65,6 +65,10 @@ export class IpcServer {
       const newline = data.indexOf(10);
       if (newline < 0) return;
       handled = true;
+      try {
+        const request = parseRequest(data.subarray(0, newline).toString("utf8"));
+        socket.setTimeout(ipcRequestTimeout(request.action), () => socket.destroy());
+      } catch { /* process() returns the authoritative parse error */ }
       this.process(socket, data.subarray(0, newline).toString("utf8")).catch(error => this.writeError(socket, "unknown", error));
     });
     socket.on("error", error => this.logger.debug(`Client connection ended: ${errorMessage(error)}`));
@@ -257,10 +261,23 @@ export class IpcServer {
         case "activity": {
           const activity = await this.queue?.currentOwnedActivity() ?? await getLegacyWorkspaceActivity(expected);
           const modelConflict = this.queue?.modelConflict();
-          const queueActive = this.queue?.getEnqueueContext().active === true;
+          const queueContext = this.queue?.getEnqueueContext();
+          const queueActive = queueContext?.active === true;
           if (!this.queue?.ownsSession(activity.sessionId)) {
             this.taskModelIdentity.clear();
-            result = { active: false, queueActive, status: "idle", ...(modelConflict ? { sessionId: modelConflict.sessionId, modelConflict } : {}) };
+            const arbitration = this.queue?.lmStudioArbitration();
+            const orphanedSessionId = !modelConflict && queueActive ? queueContext?.sessionId : undefined;
+            const modelIdentity = orphanedSessionId && arbitration?.enabled
+              ? await this.taskModelIdentity.get(orphanedSessionId, arbitration.host, arbitration.port)
+              : undefined;
+            result = {
+              active: false,
+              queueActive,
+              status: "idle",
+              ...(orphanedSessionId ? { sessionId: orphanedSessionId, orphanedQueueTask: true } : {}),
+              ...(modelIdentity ? { modelIdentity } : {}),
+              ...(modelConflict ? { sessionId: modelConflict.sessionId, modelConflict } : {})
+            };
           }
           else {
             const arbitration = this.queue.lmStudioArbitration();

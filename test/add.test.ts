@@ -4,6 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { formatExpandedRangeNotice, readTaskFiles, readTasks, splitTaskBatches } from "../src/client/commands/add";
+import { queueScaleWarning, RECOMMENDED_QUEUE_TASK_LIMIT } from "../src/common/queue_limits";
+
+test("queues accept 1000 tasks silently and warn only above the recommended limit", () => {
+  assert.equal(RECOMMENDED_QUEUE_TASK_LIMIT, 1_000);
+  assert.equal(queueScaleWarning(999, 1), undefined);
+  assert.equal(queueScaleWarning(800, 200), undefined);
+  assert.match(queueScaleWarning(800, 201) ?? "", /1001 active tasks.*recommended 1000-task limit/);
+  assert.match(queueScaleWarning(0, 1_001, true) ?? "", /1001 active tasks/);
+});
 
 test("large task payloads are split below the IPC frame limit without reordering", () => {
   const tasks = [

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { Logger } from "../src/common/logging";
-import { ClineConsoleService, isSafeCodeExtensionHostCommand, modelLeaseOccupied, modelRestorationReady, probeService, readEnqueueContext, recoverRestartArtifacts, removeExpiredRestartArtifacts, restartLeaseActive, selectModelQueueWinner, unexpectedlyClosedQueueWorkspaces, updatePreviousRunningSessions, YOLO_RESTART_LEASE_GRACE_MS, type ModelQueueObservation } from "../src/service/daemon";
+import { ClineConsoleService, isSafeCodeExtensionHostCommand, modelLeaseOccupied, modelRestorationReady, probeService, readEnqueueContext, recoverRestartArtifacts, removeExpiredRestartArtifacts, restartLeaseActive, selectModelQueueWinner, selectOrphanedModelQueue, unexpectedlyClosedQueueWorkspaces, updatePreviousRunningSessions, YOLO_RESTART_LEASE_GRACE_MS, type ModelQueueObservation } from "../src/service/daemon";
 
 const logger: Logger = { error() {}, info() {}, debug() {} };
 
@@ -58,6 +58,13 @@ test("preempted model queue waits for the full restoration delay", () => {
   assert.equal(modelRestorationReady(5_000, 20_000, 15_000), true);
 });
 
+test("released model selects orphaned queue work for a clean relaunch", () => {
+  const orphaned: ModelQueueObservation = { active: false, queueActive: true, orphanedQueueTask: true, status: "idle", workspace: "/gordon", socketPath: "/gordon.sock", sessionId: "stale", modelIdentity: "lm/model", observedAt: "2026-10-14T01:00:00Z" };
+  const unrelated: ModelQueueObservation = { active: false, queueActive: false, status: "completed", workspace: "/rebuntu", socketPath: "/rebuntu.sock", sessionId: "done", modelIdentity: "lm/model", observedAt: "2026-10-14T01:01:00Z" };
+  assert.equal(selectOrphanedModelQueue([orphaned, unrelated], "lm/model")?.workspace, "/gordon");
+  assert.equal(selectOrphanedModelQueue([orphaned, unrelated], "other/model"), undefined);
+});
+
 test("completion follow-ups retain the model lease while manual Cancel releases it", () => {
   assert.equal(modelLeaseOccupied({ status: "running", queueActive: true }), true);
   assert.equal(modelLeaseOccupied({ status: "completed", queueActive: true }), true);
@@ -91,7 +98,7 @@ test("daemon reads minimal enqueue context from a large persisted queue", async 
     { state: "running", sessionId: "owned" },
     ...Array.from({ length: 300 }, () => ({ state: "queued" }))
   ] }));
-  assert.deepEqual(await readEnqueueContext(file, "/repo"), { active: true, sessionId: "owned", status: "running" });
+  assert.deepEqual(await readEnqueueContext(file, "/repo"), { active: true, sessionId: "owned", status: "running", queueLength: 301 });
   await fs.rm(directory, { recursive: true });
 });
 

@@ -23,7 +23,7 @@ export interface TaskCompletionMonitorOptions {
   onSessionObserved?: (sessionId: string) => void | Promise<void>;
   onActivityStatus?: (status: "running" | "waiting" | "completed", completionClaim: boolean) => void | Promise<void>;
 }
-export interface WorkspaceActivity { active: boolean; queueActive?: boolean; sessionId?: string; status?: "running" | "waiting" | "idle" | "completed" | "failed"; observedAt?: string; modelIdentity?: string; modelConflict?: { winnerWorkspace: string; modelIdentity: string; interruptedAt: string }; }
+export interface WorkspaceActivity { active: boolean; queueActive?: boolean; orphanedQueueTask?: boolean; sessionId?: string; status?: "running" | "waiting" | "idle" | "completed" | "failed"; observedAt?: string; modelIdentity?: string; modelConflict?: { winnerWorkspace: string; modelIdentity: string; interruptedAt: string }; }
 export interface WorkspaceSessionStatus { sessionId: string; status: string; observedAt: string; title?: string; exitCode?: number; errorText?: string; }
 export interface WorkspaceTaskPrompt { sessionId: string; prompt: string; }
 export interface NewTaskHandoff { sessionId: string; marker: string; text?: string; repeatCount: number; }
@@ -31,6 +31,7 @@ export const BRIDGE_SUBMISSION_GRACE_MS = 30_000;
 export const UI_RUNNING_STALE_MS = 15 * 60_000;
 export const MANUAL_COMPLETED_TASK_RESUME_GAP_MS = 5_000;
 export const SAME_THREAD_ACK_MARKER = "[cline-console:same-thread-handoff]";
+const legacyStorageRoot = (override?: string): string => override || process.env.CLINE_VSCODE_STORAGE_DIR?.trim() || path.join(os.homedir(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
 const SAME_THREAD_INSTRUCTION = /(?:finish|continue|remain|work)\s+(?:the\s+)?(?:current\s+)?(?:original\s+)?(?:task\s+)?in\s+this\s+(?:exact\s+)?(?:same\s+)?(?:Cline\s+)?thread/i;
 
 function isSameThreadAcknowledgement(message: Record<string, unknown>): boolean {
@@ -78,7 +79,7 @@ function normalizeHandoffText(value: unknown): string {
 }
 
 export async function waitForLegacyNewTaskHandoffAcknowledgement(handoff: NewTaskHandoff, signal: AbortSignal, vscodeStorageOverride?: string, timeoutMs = 10_000): Promise<boolean> {
-  const storage = vscodeStorageOverride || process.env.CLINE_VSCODE_STORAGE_DIR?.trim() || path.join(os.homedir(), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev");
+  const storage = legacyStorageRoot(vscodeStorageOverride);
   const file = path.join(storage, "tasks", handoff.sessionId, "ui_messages.json");
   const deadline = Date.now() + timeoutMs;
   while (!signal.aborted && Date.now() <= deadline) {
@@ -87,6 +88,39 @@ export async function waitForLegacyNewTaskHandoffAcknowledgement(handoff: NewTas
       const handoffIndex = messages.findIndex((message, index) => message.ask === "new_task" && `${handoff.sessionId}:${String(message.ts ?? index)}` === handoff.marker);
       if (handoffIndex >= 0 && messages.slice(handoffIndex + 1).some(isSameThreadAcknowledgement)) return true;
     } catch { /* The UI message file may be updating atomically. */ }
+    await abortableDelay(Math.min(250, Math.max(0, deadline - Date.now())), signal);
+  }
+  return false;
+}
+
+/**
+ * Return how many durable Cline UI records contain this exact user feedback.
+ * Undefined means this is not a readable Legacy Cline task, so callers may
+ * retain adapter-only behavior for other integrations and isolated tests.
+ */
+export async function getLegacyUserFeedbackCount(sessionId: string, message: string, vscodeStorageOverride?: string): Promise<number | undefined> {
+  try {
+    const file = path.join(legacyStorageRoot(vscodeStorageOverride), "tasks", sessionId, "ui_messages.json");
+    const messages = JSON.parse(await fs.readFile(file, "utf8")) as Array<Record<string, unknown>>;
+    return messages.filter(entry => entry.say === "user_feedback" && entry.text === message).length;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Wait until a send is visible in Cline's durable transcript, not merely acknowledged by RPC. */
+export async function waitForLegacyUserFeedback(
+  sessionId: string,
+  message: string,
+  previousCount: number,
+  signal: AbortSignal,
+  vscodeStorageOverride?: string,
+  timeoutMs = 5_000
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (!signal.aborted && Date.now() <= deadline) {
+    const count = await getLegacyUserFeedbackCount(sessionId, message, vscodeStorageOverride);
+    if (count !== undefined && count > previousCount) return true;
     await abortableDelay(Math.min(250, Math.max(0, deadline - Date.now())), signal);
   }
   return false;

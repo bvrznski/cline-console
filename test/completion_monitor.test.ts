@@ -4,9 +4,31 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { Logger } from "../src/common/logging";
-import { findUnresolvedTestTimeout, findUserConfirmedDone, getLatestLegacyWorkspaceTaskPrompt, getLegacyNewTaskHandoff, getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, getOwnedLegacyTaskActivity, hasImplementationActivitySince, MANUAL_COMPLETED_TASK_RESUME_GAP_MS, reconcileLegacyStatus, UI_RUNNING_STALE_MS, waitForLegacyMessageCompletion, waitForLegacyNewTaskHandoffAcknowledgement, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle, waitForLegacyWorkspaceIdleStability } from "../src/integrations/cline/completion_monitor";
+import { findUnresolvedTestTimeout, findUserConfirmedDone, getLatestLegacyWorkspaceTaskPrompt, getLegacyNewTaskHandoff, getLegacyUserFeedbackCount, getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, getOwnedLegacyTaskActivity, hasImplementationActivitySince, MANUAL_COMPLETED_TASK_RESUME_GAP_MS, reconcileLegacyStatus, UI_RUNNING_STALE_MS, waitForLegacyMessageCompletion, waitForLegacyNewTaskHandoffAcknowledgement, waitForLegacyTaskCompletion, waitForLegacyUserFeedback, waitForLegacyWorkspaceIdle, waitForLegacyWorkspaceIdleStability } from "../src/integrations/cline/completion_monitor";
 
 const logger: Logger = { error() {}, info() {}, debug() {} };
+
+test("task-bound delivery confirmation requires a new durable user_feedback record", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-feedback-"));
+  const id = "owned-session", message = "Continue the exact task";
+  const taskDirectory = path.join(root, "tasks", id);
+  await fs.mkdir(taskDirectory, { recursive: true });
+  const file = path.join(taskDirectory, "ui_messages.json");
+  await fs.writeFile(file, JSON.stringify([{ ts: 1, ask: "resume_task" }]));
+  assert.equal(await getLegacyUserFeedbackCount(id, message, root), 0);
+  const controller = new AbortController();
+  const confirmation = waitForLegacyUserFeedback(id, message, 0, controller.signal, root, 1_000);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await fs.writeFile(file, JSON.stringify([
+    { ts: 1, ask: "resume_task" },
+    { ts: 2, say: "user_feedback", text: message }
+  ]));
+  assert.equal(await confirmation, true);
+  assert.equal(await getLegacyUserFeedbackCount(id, message, root), 1);
+  assert.equal(await waitForLegacyUserFeedback(id, message, 1, controller.signal, root, 10), false);
+  assert.equal(await getLegacyUserFeedbackCount("missing", message, root), undefined);
+  await fs.rm(root, { recursive: true });
+});
 
 test("standalone DONE accepts only explicit user feedback", () => {
   assert.equal(findUserConfirmedDone([

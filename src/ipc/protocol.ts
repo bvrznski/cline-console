@@ -3,6 +3,14 @@ import { ClineConsoleError } from "../common/errors";
 import { PROTOCOL_VERSION } from "../common/version";
 import type { Action, IpcRequest, IpcResponse } from "./types";
 
+export const DEFAULT_IPC_REQUEST_TIMEOUT_MS = 30_000;
+export const QUEUE_MUTATION_TIMEOUT_MS = 10 * 60_000;
+const LONG_QUEUE_ACTIONS = new Set<Action>(["enqueueTasks", "enqueueMessages", "replaceQueue", "clearQueue", "clearWorkspace", "popQueue", "trimQueue"]);
+
+export function ipcRequestTimeout(action: Action): number {
+  return LONG_QUEUE_ACTIONS.has(action) ? QUEUE_MUTATION_TIMEOUT_MS : DEFAULT_IPC_REQUEST_TIMEOUT_MS;
+}
+
 export const MAX_MESSAGE_MIB = 512;
 export const MAX_MESSAGE_BYTES = MAX_MESSAGE_MIB * 1024 * 1024;
 

@@ -3,7 +3,7 @@ import net from "node:net";
 import path from "node:path";
 import { ClineConsoleError, errorMessage } from "../common/errors";
 import type { Logger } from "../common/logging";
-import { makeRequest, MAX_MESSAGE_BYTES, MAX_MESSAGE_MIB, parseRequest, serializeResponse } from "../ipc/protocol";
+import { DEFAULT_IPC_REQUEST_TIMEOUT_MS, ipcRequestTimeout, makeRequest, MAX_MESSAGE_BYTES, MAX_MESSAGE_MIB, parseRequest, serializeResponse } from "../ipc/protocol";
 import { requestOverSocket } from "../ipc/transport";
 import type { IpcResponse, WorkspaceRegistration } from "../ipc/types";
 import { loadRegistrations, waitForWorkspaceRegistration } from "../client/ipc_client";
@@ -66,6 +66,18 @@ export function modelRestorationReady(releasedAt: number | undefined, now = Date
   return releasedAt !== undefined && now - releasedAt >= delayMs;
 }
 
+export function selectOrphanedModelQueue(
+  observations: ReadonlyArray<ModelQueueObservation>,
+  modelIdentity: string,
+  currentOwner?: { workspace: string; sessionId: string }
+): ModelQueueObservation | undefined {
+  const candidates = observations.filter(value => value.orphanedQueueTask === true && value.queueActive === true
+    && value.sessionId && value.modelIdentity === modelIdentity);
+  if (!candidates.length) return undefined;
+  const retained = currentOwner && candidates.find(value => value.workspace === currentOwner.workspace && value.sessionId === currentOwner.sessionId);
+  return retained ?? latestModelObservation(candidates);
+}
+
 /** A terminal completion claim is not a released model while its queue is
  * still auditing or delivering follow-up work.  A waiting state, however, is
  * an explicit manual Cancel boundary and must yield to another resumed queue. */
@@ -108,6 +120,7 @@ export class ClineConsoleService {
   private readonly preemptedModelQueues = new Map<string, PreemptedModelQueue[]>();
   private readonly modelReleasedAt = new Map<string, number>();
   private readonly restartLeaseProtections = new Map<string, RestartLeaseProtection>();
+  private readonly orphanRelaunchesInFlight = new Set<string>();
   private readonly preferredWorkspaceByModel = new Map<string, { workspace: string; until: number }>();
   private readonly missingWorkspaceSince = new Map<string, number>();
   private readonly workspaceReopenAttemptedAt = new Map<string, number>();
@@ -152,7 +165,7 @@ export class ClineConsoleService {
   }
 
   private handle(socket: net.Socket): void {
-    socket.setTimeout(30_000, () => socket.destroy());
+    socket.setTimeout(DEFAULT_IPC_REQUEST_TIMEOUT_MS, () => socket.destroy());
     let data = Buffer.alloc(0), handled = false;
     socket.on("data", chunk => {
       if (handled) return;
@@ -170,6 +183,7 @@ export class ClineConsoleService {
     let request;
     try { request = parseRequest(line); } catch (error) { this.writeError(socket, "unknown", error); return; }
     try {
+      socket.setTimeout(ipcRequestTimeout(request.action) + 5_000, () => socket.destroy());
       if (request.action === "enqueueContext") {
         const result = await readEnqueueContext(queueStatePath(request.workspace), request.workspace);
         socket.end(serializeResponse({ protocolVersion: 1, requestId: request.requestId, ok: true, result }));
@@ -184,7 +198,7 @@ export class ClineConsoleService {
       }
       const registration = await waitForWorkspaceRegistration(request.workspace, request.workspace, this.directory);
       this.logger.info(`Routing ${request.action} request ${request.requestId} to ${registration.workspace}.`);
-      const response = await requestOverSocket(registration.socketPath, request, 30_000);
+      const response = await requestOverSocket(registration.socketPath, request, ipcRequestTimeout(request.action));
       if (request.action === "resumeQueue" && response.ok) {
         await this.preferResumedWorkspace(registration).catch(error => this.logger.error(`Explicit queue takeover failed safely for ${registration.workspace}: ${errorMessage(error)}`));
       }
@@ -301,6 +315,35 @@ export class ClineConsoleService {
         await this.preemptModelCompetitor(loser, winner, modelIdentity);
       }
       if (resumedInCline) await this.resumeModelWinnerQueue(winner, modelIdentity);
+    }
+
+    const orphanedIdentities = new Set(observations.flatMap(value => value.orphanedQueueTask && value.modelIdentity ? [value.modelIdentity] : []));
+    for (const modelIdentity of orphanedIdentities) {
+      if (groups.has(modelIdentity)) continue;
+      const candidate = selectOrphanedModelQueue(observations, modelIdentity, this.modelOwners.get(modelIdentity));
+      if (!candidate?.sessionId) continue;
+      const competitor = observations.some(value => value.workspace !== candidate.workspace
+        && value.modelIdentity === modelIdentity && modelLeaseOccupied(value));
+      if (competitor || restartLeaseActive(this.restartLeaseProtections.get(candidate.workspace), candidate, now)) continue;
+      const releasedAt = this.modelReleasedAt.get(modelIdentity);
+      if (releasedAt === undefined) {
+        this.modelReleasedAt.set(modelIdentity, now);
+        this.logger.info(`LM Studio model ${modelIdentity} is available; waiting ${TASK_DISPATCH_DELAY_MS / 1_000} seconds before relaunching orphaned queue work in ${candidate.workspace}.`);
+        continue;
+      }
+      if (!modelRestorationReady(releasedAt, now) || this.orphanRelaunchesInFlight.has(candidate.workspace)) continue;
+      this.orphanRelaunchesInFlight.add(candidate.workspace);
+      try {
+        const response = await requestOverSocket(candidate.socketPath, makeRequest("relaunchQueue", candidate.workspace), 30_000);
+        if (!response.ok) throw new Error(response.error?.message ?? "Workspace rejected orphaned queue relaunch.");
+        this.modelOwners.set(modelIdentity, { workspace: candidate.workspace, sessionId: candidate.sessionId });
+        this.modelReleasedAt.delete(modelIdentity);
+        this.logger.info(`Relaunched orphaned queue task ${candidate.sessionId} in ${candidate.workspace} after the competing model lease was released.`);
+      } catch (error) {
+        this.logger.error(`Orphaned queue relaunch failed safely for ${candidate.workspace}: ${errorMessage(error)}`);
+      } finally {
+        this.orphanRelaunchesInFlight.delete(candidate.workspace);
+      }
     }
 
     const trackedIdentities = new Set([...this.modelOwners.keys(), ...this.preemptedModelQueues.keys()]);
@@ -486,14 +529,15 @@ export class ClineConsoleService {
   }
 }
 
-export async function readEnqueueContext(file: string, workspace: string): Promise<{ active: boolean; sessionId?: string; status: "running" | "idle" }> {
+export async function readEnqueueContext(file: string, workspace: string): Promise<{ active: boolean; sessionId?: string; status: "running" | "idle"; queueLength: number }> {
   const value = JSON.parse(await fs.readFile(file, "utf8")) as {
     workspace?: string;
     items?: Array<{ state?: string; sessionId?: string }>;
   };
   if (value.workspace !== workspace || !Array.isArray(value.items)) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Persisted queue state is unavailable.");
   const current = value.items.find(item => item.state === "running");
-  return current ? { active: true, sessionId: current.sessionId, status: "running" } : { active: false, status: "idle" };
+  const queueLength = value.items.reduce((count, item) => count + (item.state === "running" || item.state === "queued" ? 1 : 0), 0);
+  return current ? { active: true, sessionId: current.sessionId, status: "running", queueLength } : { active: false, status: "idle", queueLength };
 }
 
 export function isSafeCodeExtensionHostCommand(command: string): boolean {

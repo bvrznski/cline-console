@@ -310,6 +310,11 @@ The CLI prints the expanded file list before queuing.
 `queue replace` accepts the same range form. Directory traversal is recursive.
 Large additions use bounded concurrent file reads and linear-size IPC batching;
 input order is retained without repeatedly serializing the growing batch.
+Queues containing up to 1000 active tasks are accepted without a scale warning.
+Larger queues remain supported, but `queue add` and `queue replace` warn before
+the mutation because persistence and terminal rendering may take longer. Queue
+state uses compact atomic JSON, while SQLite append history is written in one
+transaction per IPC batch.
 
 `queue add --from MANIFEST` reads one task-file path per line, preserves the
 manifest order, ignores blank lines and `#` comments, and resolves relative
@@ -461,7 +466,7 @@ set globally or overridden for one workspace. The defaults are:
 | `cline-console.taskScanner.maxCompletionVerificationRounds` | `3` | Bounds verification loops: after three requested passes, a completion with no explicit incomplete-work indicators may proceed even when validation cleanup or further implementation activity was detected. The fallback is recorded as `bounded_round_limit`. |
 | `cline-console.taskScanner.reflective` | `false` | Requests a same-thread implementation reflection and stores its completion in history. |
 | `cline-console.taskScanner.restartOnYoloFailure` | `true` | Requests guarded workspace recovery after Cline explicitly stops for three consecutive YOLO-mode mistakes. |
-| `cline-console.taskScanner.waitForLmStudio` | `true` | Holds recovered and newly dispatched queue work until the configured LM Studio endpoint accepts TCP connections. |
+| `cline-console.taskScanner.waitForLmStudio` | `true` | Holds recovered and newly dispatched queue work until `/v1/models` on the configured LM Studio endpoint reports at least one loaded model. A listening server with an empty model list is not ready. |
 | `cline-console.taskScanner.lmStudioHost` | `127.0.0.1` | Host checked by the LM Studio readiness gate. |
 | `cline-console.taskScanner.lmStudioPort` | `1234` | Port checked by the LM Studio readiness gate. |
 | `cline-console.taskScanner.singleQueuePerLmStudioModel` | `true` | Allows one active console-owned queue per loaded LM Studio model; a newly resumed competitor presses Cancel in the previous task thread, marks it interrupted, and automatically resumes that same thread 15 seconds after the winner releases the model. |
@@ -471,7 +476,10 @@ override: its exact workspace becomes the arbitration winner and the competing
 console-owned task is cancelled into `interrupted`. A manual **Cancel** releases
 the lease; the most recently preempted online queue resumes after the configured
 15-second handoff delay. Intermediate completion checks retain the lease until
-the queue really advances. Resuming a queue whose owned Cline thread is showing
+the queue really advances. If a persisted `running` queue head has lost its
+owned Cline session, releasing the competing model lease triggers a clean
+same-item relaunch after the same 15-second delay instead of skipping the task.
+Resuming a queue whose owned Cline thread is showing
 **Resume Task** actively continues that exact thread instead of merely restarting
 the passive completion monitor. YOLO recovery opens the exact workspace in a new VS
 Code window instead of reusing whichever window happened to be most recent.

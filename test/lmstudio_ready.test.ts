@@ -24,23 +24,24 @@ test("LM Studio readiness probe recognizes an accepting TCP endpoint", async t =
   assert.equal(await probeTcp("127.0.0.1", address.port, 250), true);
 });
 
-test("LM Studio readiness wait holds until the endpoint becomes available", async t => {
-  const reservation = await listen();
-  const address = reservation.address();
-  assert.ok(address && typeof address !== "string");
-  const port = address.port;
-  await new Promise<void>(resolve => reservation.close(() => resolve()));
-
-  const controller = new AbortController();
-  const waiting = waitForLmStudio("127.0.0.1", port, controller.signal, logger, 10);
-  await new Promise(resolve => setTimeout(resolve, 30));
-  const server = net.createServer(socket => socket.end());
-  t.after(() => server.close());
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, "127.0.0.1", resolve);
+test("LM Studio readiness wait holds until the endpoint reports a loaded model", async t => {
+  let loaded = false;
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ data: loaded ? [{ id: "loaded-model" }] : [] }));
   });
+  await new Promise<void>((resolve, reject) => server.listen(0, "127.0.0.1", resolve).once("error", reject));
+  t.after(() => server.close());
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const controller = new AbortController();
+  let ready = false;
+  const waiting = waitForLmStudio("127.0.0.1", address.port, controller.signal, logger, 10).then(() => { ready = true; });
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(ready, false);
+  loaded = true;
   await waiting;
+  assert.equal(ready, true);
 });
 
 test("LM Studio model identity is stable and model-specific", async t => {

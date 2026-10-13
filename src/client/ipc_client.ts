@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { ClineConsoleError } from "../common/errors";
-import { makeRequest } from "../ipc/protocol";
+import { ipcRequestTimeout, makeRequest } from "../ipc/protocol";
 import { requestOverSocket } from "../ipc/transport";
 import type { Action, IpcRequest, WorkspaceRegistration } from "../ipc/types";
 import { runtimeDirectory } from "../extension/workspace_registry";
@@ -89,7 +89,6 @@ async function findByRealPath(registrations: WorkspaceRegistration[], wanted: st
  * Maximum number of auto-restart attempts
  */
 const MAX_AUTO_RESTART_ATTEMPTS = 1;
-const SERVICE_REQUEST_TIMEOUT_MS = 35_000;
 const HANGUP_PING_TIMEOUT_MS = 1_500;
 
 export async function invoke(registration: WorkspaceRegistration, action: Action, payload?: IpcRequest["payload"]): Promise<unknown> {
@@ -99,7 +98,7 @@ export async function invoke(registration: WorkspaceRegistration, action: Action
     // The daemon allows the workspace companion up to 30 seconds to answer.
     // Keep the outer client deadline slightly longer so a slow operation is not
     // misclassified as a hung extension while the daemon is still processing it.
-    const response = await requestOverSocket(serviceSocket, makeRequest(action, registration.workspace, payload), SERVICE_REQUEST_TIMEOUT_MS);
+    const response = await requestOverSocket(serviceSocket, makeRequest(action, registration.workspace, payload), ipcRequestTimeout(action) + 10_000);
     if (!response.ok) throw new ClineConsoleError(response.error?.code ?? "REMOTE_ERROR", response.error?.message ?? "Unknown VS Code extension error.");
     return response.result;
   } catch (error: unknown) {
@@ -129,7 +128,7 @@ export async function invoke(registration: WorkspaceRegistration, action: Action
           await new Promise(resolve => setTimeout(resolve, 2000));
 
           // Try the original request again after restart
-          const response = await requestOverSocket(serviceSocket, makeRequest(action, registration.workspace, payload), SERVICE_REQUEST_TIMEOUT_MS);
+          const response = await requestOverSocket(serviceSocket, makeRequest(action, registration.workspace, payload), ipcRequestTimeout(action) + 10_000);
           if (!response.ok) throw new ClineConsoleError(response.error?.code ?? "REMOTE_ERROR", response.error?.message ?? "Unknown VS Code extension error.");
           return response.result;
         } catch (restartError) {

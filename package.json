@@ -203,7 +203,7 @@
           "type": "boolean",
           "default": true,
           "scope": "application",
-          "description": "Hold queue recovery and new task dispatch after startup until the configured LM Studio TCP endpoint is accepting connections."
+          "description": "Hold queue recovery and new task dispatch after startup until the configured LM Studio endpoint reports at least one loaded model through /v1/models."
         },
         "cline-console.taskScanner.lmStudioHost": {
           "type": "string",

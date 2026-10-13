@@ -50,12 +50,13 @@ export async function getLmStudioModelIdentity(host: string, port: number, timeo
 export async function waitForLmStudio(host: string, port: number, signal: AbortSignal, logger: Logger, pollMs = 2_000): Promise<void> {
   let announced = false;
   while (!signal.aborted) {
-    if (await probeTcp(host, port)) {
-      if (announced) logger.info(`LM Studio is ready at ${host}:${port}; queue execution may continue.`);
+    const modelIdentity = await getLmStudioModelIdentity(host, port);
+    if (modelIdentity) {
+      if (announced) logger.info(`LM Studio model is loaded at ${host}:${port}; queue execution may continue (${modelIdentity}).`);
       return;
     }
     if (!announced) {
-      logger.info(`Queue waiting for LM Studio at ${host}:${port}.`);
+      logger.info(`Queue waiting for LM Studio to report a loaded model at ${host}:${port}.`);
       announced = true;
     }
     await new Promise<void>(resolve => {

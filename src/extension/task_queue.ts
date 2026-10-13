@@ -6,7 +6,7 @@ import { taskTitle } from "../common/task_title";
 import type { Logger } from "../common/logging";
 import type { ClineAdapter } from "../integrations/cline/types";
 import type { QueueStatus, TokenUsage } from "../ipc/types";
-import { getLatestLegacyWorkspaceTaskPrompt, getLegacyNewTaskHandoff, getLegacyWorkspaceSessionStatus, getOwnedLegacyTaskActivity, SAME_THREAD_ACK_MARKER, type WorkspaceActivity, waitForLegacyMessageCompletion, waitForLegacyNewTaskHandoffAcknowledgement, waitForLegacyTaskCompletion, waitForLegacyWorkspaceIdle, waitForLegacyWorkspaceIdleStability } from "../integrations/cline/completion_monitor";
+import { getLatestLegacyWorkspaceTaskPrompt, getLegacyNewTaskHandoff, getLegacyUserFeedbackCount, getLegacyWorkspaceSessionStatus, getOwnedLegacyTaskActivity, SAME_THREAD_ACK_MARKER, type WorkspaceActivity, waitForLegacyMessageCompletion, waitForLegacyNewTaskHandoffAcknowledgement, waitForLegacyTaskCompletion, waitForLegacyUserFeedback, waitForLegacyWorkspaceIdle, waitForLegacyWorkspaceIdleStability } from "../integrations/cline/completion_monitor";
 import { auditCompletionReport, extractAuditRecommendations, extractRemainingSteps } from "../integrations/cline/remaining_work";
 import type { HistoryStore } from "../history/history_store";
 import { writeYoloRestartRequest } from "../service/restart_request";
@@ -465,6 +465,21 @@ export class TaskQueue {
       return { relaunched: false, queueLength };
     }
     const previousSessionId = item.sessionId;
+    // Cline Legacy may leave the interrupted/completed thread selected after a
+    // workspace recovery. Calling newTask while that thread is still active can
+    // block indefinitely and leave the queue IPC handler wedged. The persisted
+    // running head is already an owned cline-console task, so cancel that exact
+    // execution before starting its prompt from scratch.
+    if (previousSessionId && this.ownsSession(previousSessionId)) {
+      await withAbortableTimeout(
+        this.adapter.cancelTask(),
+        this.abortController.signal,
+        POLICY_MESSAGE_TIMEOUT_MS,
+        `Timed out cancelling Cline session ${previousSessionId} before relaunch.`,
+        `Queue monitor stopped while cancelling Cline session ${previousSessionId} before relaunch.`
+      );
+      await abortableDelay(DISPATCH_STABILITY_DELAY_MS, this.abortController.signal);
+    }
     const started = await this.adapter.newTask(item.prompt);
     let sessionId = started.taskId;
     const deadline = Date.now() + POLICY_MESSAGE_TIMEOUT_MS;
@@ -1224,7 +1239,24 @@ export class TaskQueue {
   }
 
   private async sendToOwnedSession(sessionId: string, message: string, purpose: string, selectSession = true): Promise<void> {
-    const delivery = this.deliveryChain.then(() => deliverTaskBoundMessage(this.adapter, sessionId, message, purpose, this.abortController.signal, this.ownsSession(sessionId), selectSession));
+    const delivery = this.deliveryChain.then(async () => {
+      const priorCount = await getLegacyUserFeedbackCount(sessionId, message);
+      // A missing transcript means a non-Legacy adapter or an isolated test;
+      // preserve the adapter contract in that case. For real Legacy tasks,
+      // require durable evidence because its RPC may resolve after only
+      // selecting resume_task while silently dropping the message itself.
+      if (priorCount === undefined) {
+        await deliverTaskBoundMessage(this.adapter, sessionId, message, purpose, this.abortController.signal, this.ownsSession(sessionId), selectSession);
+        return;
+      }
+      const maximumAttempts = 3;
+      for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+        await deliverTaskBoundMessage(this.adapter, sessionId, message, purpose, this.abortController.signal, this.ownsSession(sessionId), selectSession);
+        if (await waitForLegacyUserFeedback(sessionId, message, priorCount, this.abortController.signal)) return;
+        this.logger.error(`Cline did not persist ${purpose} for session ${sessionId} after delivery attempt ${attempt}/${maximumAttempts}.`);
+      }
+      throw new ClineConsoleError("CLINE_MESSAGE_NOT_PERSISTED", `Cline did not persist ${purpose} for session ${sessionId} after ${maximumAttempts} delivery attempts.`);
+    });
     this.deliveryChain = delivery.catch(() => undefined);
     await delivery;
   }
@@ -1238,7 +1270,10 @@ export class TaskQueue {
       }
       throw new ClineConsoleError("QUEUE_WRITER_LEASE_LOST", "This extension host no longer owns the workspace queue writer lease.");
     }
-    const serialized = JSON.stringify(this.data, null, 2);
+    // This file is machine-owned state. Compact serialization materially
+    // reduces allocation and filesystem I/O for queues containing hundreds or
+    // thousands of prompts while retaining the same atomic rename protocol.
+    const serialized = JSON.stringify(this.data);
     const operation = this.persistenceChain.catch(() => undefined).then(async () => {
       await fs.mkdir(path.dirname(this.file), { recursive: true, mode: 0o700 });
       const temporary = `${this.file}.${process.pid}.${randomUUID()}.tmp`;

@@ -6,9 +6,11 @@ import type { IpcRequest, IpcResponse } from "./types";
 export async function requestOverSocket(socketPath: string, request: IpcRequest, timeoutMs = 15_000): Promise<IpcResponse> {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath);
-    let data = Buffer.alloc(0);
+    let data = Buffer.alloc(0), settled = false;
     const timer = setTimeout(() => socket.destroy(new ClineConsoleError("TIMEOUT", "Timed out waiting for the VS Code extension.")), timeoutMs);
     const done = (error?: Error, response?: IpcResponse): void => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer); socket.destroy();
       if (error) reject(error); else resolve(response as IpcResponse);
     };
@@ -22,6 +24,7 @@ export async function requestOverSocket(socketPath: string, request: IpcRequest,
       catch { done(new ClineConsoleError("MALFORMED_RESPONSE", "VS Code returned malformed JSON.")); }
     });
     socket.once("error", error => done(error));
-    socket.once("end", () => { if (!data.includes(10)) done(new ClineConsoleError("EMPTY_RESPONSE", "VS Code closed the IPC connection without a response.")); });
+    socket.once("end", () => { if (!settled && !data.includes(10)) done(new ClineConsoleError("EMPTY_RESPONSE", "VS Code closed the IPC connection without a response.")); });
+    socket.once("close", () => { if (!settled && !data.includes(10)) done(new ClineConsoleError("EMPTY_RESPONSE", "VS Code closed the IPC connection without a response.")); });
   });
 }

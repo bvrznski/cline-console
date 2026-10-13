@@ -927,6 +927,32 @@ test("task reload atomically moves the running queue item to the successor sessi
   }
 });
 
+test("queue relaunch cancels the owned running thread before starting it from scratch", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-relaunch-")), file = path.join(root, "queue.json");
+  await fs.writeFile(file, JSON.stringify({ version: 1, workspace: "/repo", paused: true, ownedSessionIds: ["old"], items: [
+    { id: "running", kind: "task", sourcePath: "/tasks/one.md", prompt: "Task", state: "running", queuedAt: "before", dispatchedAt: "before", sessionId: "old" }
+  ] }));
+  const calls: string[] = [];
+  const adapter = {
+    cancelTask: async () => { calls.push("cancel:old"); },
+    newTask: async (prompt: string) => { calls.push(`new:${prompt}`); return { taskStarted: true, taskId: "new" }; }
+  } as unknown as ClineAdapter;
+  const queue = new TaskQueue(file, "/repo", adapter, logger);
+  try {
+    await queue.start();
+    const result = await queue.relaunchCurrent();
+    assert.deepEqual(calls, ["cancel:old", "new:Task"]);
+    assert.equal(result.relaunched, true);
+    assert.equal(result.previousSessionId, "old");
+    assert.equal(result.sessionId, "new");
+    const persisted = JSON.parse(await fs.readFile(file, "utf8")) as { items: Array<{ sessionId?: string }> };
+    assert.equal(persisted.items[0].sessionId, "new");
+  } finally {
+    await queue.stop();
+    await fs.rm(root, { recursive: true });
+  }
+});
+
 test("queue rejects duplicate task sources unless explicitly confirmed", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-duplicate-queue-")), file = path.join(root, "queue.json");
   await fs.writeFile(file, JSON.stringify({ version: 1, workspace: "/repo", paused: true, items: [

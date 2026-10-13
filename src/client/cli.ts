@@ -29,6 +29,7 @@ import { queueStateDirectory } from "../extension/workspace_registry";
 import { runtimeDirectory } from "../extension/workspace_registry";
 import { HistoryStore, historyDatabasePath } from "../history/history_store";
 import { runWatch } from "./commands/watch";
+import { queueScaleWarning } from "../common/queue_limits";
 
 export { normalizeCommand, parseArgs } from "./grammar";
 
@@ -298,7 +299,7 @@ export async function run(argv = process.argv.slice(2)): Promise<number> {
   }
   const selected = await selectWorkspace(registrations, parsed.workspace);
   if (parsed.command === "add") {
-    const queueContext = await invoke(selected, "enqueueContext") as { active: boolean; sessionId?: string; status: "running" | "idle" };
+    const queueContext = await invoke(selected, "enqueueContext") as { active: boolean; sessionId?: string; status: "running" | "idle"; queueLength: number };
     const activity = queueContext.active ? queueContext
       : await invoke(selected, "activity") as { active: boolean; sessionId?: string; status: "running" | "waiting" | "idle" | "completed" | "failed" };
     const waitingChoice = activity.status === "waiting" ? await promptForWaitingTaskChoice(parsed.timeoutMs) : undefined;
@@ -310,6 +311,8 @@ export async function run(argv = process.argv.slice(2)): Promise<number> {
     const input = await readTasks(parsed.commandArgs, { ...readTaskOptions(parsed), workspaceDirectory: selected.workspace });
     if (input.expandedRange?.length) process.stdout.write(formatExpandedRangeNotice(input.expandedRange, input.rangeGapReport));
     const tasks = input.tasks.map(task => ({ ...task, ...(parsed.reflective !== undefined ? { reflective: parsed.reflective } : {}), ...(scopePath ? { scopePath } : {}) }));
+    const replacedHeadCount = (parsed.force || parsed.freshOnInterrupted) && queueContext.active ? 1 : 0;
+    writeQueueScaleWarning(queueContext.queueLength - replacedHeadCount, tasks.length);
     if (waitingChoice === "resume") {
       await invoke(selected, "reloadTask");
       process.stdout.write("Incomplete task resumed from its original prompt.\n");
@@ -329,6 +332,7 @@ export async function run(argv = process.argv.slice(2)): Promise<number> {
     const input = await readTasks(parsed.commandArgs, { ...readTaskOptions(parsed), workspaceDirectory: selected.workspace });
     if (input.expandedRange?.length) process.stdout.write(formatExpandedRangeNotice(input.expandedRange, input.rangeGapReport));
     const tasks = input.tasks.map(task => ({ ...task, ...(parsed.reflective !== undefined ? { reflective: parsed.reflective } : {}), ...(scopePath ? { scopePath } : {}) }));
+    writeQueueScaleWarning(0, tasks.length, true);
     const result = await replaceQueueInBatches(selected, tasks);
     process.stdout.write(`Workspace: ${selected.workspace}\nReplaced waiting items: ${result.replaced}\nQueued: ${result.queued}\nQueue length: ${result.queueLength}\n`);
   } else if (parsed.command === "new") {
@@ -431,6 +435,11 @@ async function enqueueTasksWithDuplicateConfirmation(selected: Awaited<ReturnTyp
     interruptedOverridden ||= result.interruptedOverridden === true;
   }
   return { queued, queueLength, ...(interruptedOverridden ? { interruptedOverridden: true } : {}) };
+}
+
+function writeQueueScaleWarning(currentCount: number, addedCount: number, replace = false): void {
+  const warning = queueScaleWarning(currentCount, addedCount, replace);
+  if (warning) process.stderr.write(`Warning: ${warning}\n`);
 }
 
 async function replaceQueueInBatches(selected: Awaited<ReturnType<typeof selectWorkspace>>, tasks: Array<TaskFile & { reflective?: boolean; scopePath?: string }>): Promise<{ queued: number; replaced: number; queueLength: number }> {

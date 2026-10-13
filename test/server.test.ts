@@ -8,6 +8,7 @@ import type { Logger } from "../src/common/logging";
 import { IpcServer, isPollingAction, summarizeRequest, summarizeResponse } from "../src/extension/server";
 import { socketPath, workspaceId } from "../src/extension/workspace_registry";
 import type { ClineAdapter } from "../src/integrations/cline/types";
+import { DEFAULT_IPC_REQUEST_TIMEOUT_MS, ipcRequestTimeout, QUEUE_MUTATION_TIMEOUT_MS } from "../src/ipc/protocol";
 
 const logger: Logger = { error() {}, info() {}, debug() {} };
 const adapter = {} as ClineAdapter;
@@ -16,6 +17,14 @@ test("high-frequency status polling is excluded from durable IPC history", () =>
   assert.equal(isPollingAction("queueStatus"), true);
   assert.equal(isPollingAction("status"), true);
   assert.equal(isPollingAction("enqueueTasks"), false);
+});
+
+test("queue mutations receive an extended end-to-end IPC deadline", () => {
+  for (const action of ["enqueueTasks", "enqueueMessages", "replaceQueue", "clearQueue", "clearWorkspace", "popQueue", "trimQueue"] as const) {
+    assert.equal(ipcRequestTimeout(action), QUEUE_MUTATION_TIMEOUT_MS, action);
+  }
+  assert.equal(ipcRequestTimeout("queueStatus"), DEFAULT_IPC_REQUEST_TIMEOUT_MS);
+  assert.equal(ipcRequestTimeout("status"), DEFAULT_IPC_REQUEST_TIMEOUT_MS);
 });
 
 test("durable IPC summaries never duplicate prompt or queue response bodies", () => {
