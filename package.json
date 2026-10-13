@@ -238,7 +238,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.0.0",
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "^1.140.0",
     "@vscode/vsce": "^3.6.0",
     "typescript": "^5.7.0"
   },
