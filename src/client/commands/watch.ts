@@ -124,10 +124,16 @@ export function renderWatch(sections: WatchSection[], width = 100, colors = fals
   const globalUsage = sections.reduce((total, section) => section.queue?.tokenUsage ? addTokenUsage(total, section.queue.tokenUsage) : total, emptyTokenUsage());
   lines.push(bold(line(`GLOBAL TOKENS: ${formatTokenCount(globalUsage.total)} total | ${formatTokenCount(globalUsage.input)} in | ${formatTokenCount(globalUsage.output)} out | cache R ${formatTokenCount(globalUsage.cacheReads)} W ${formatTokenCount(globalUsage.cacheWrites)} | ${globalUsage.sessions} managed session(s)`, "magenta"), colors));
   if (!sections.length) lines.push(line("No active queues."));
+  // Reconciliation can return stale/non-running records before the active one.
+  // Use a stable priority sort for presentation only; persisted execution order
+  // and the relative order of every non-running item remain unchanged.
+  const runningFirst = <T extends { state: string }>(items: readonly T[]): T[] =>
+    [...items].sort((left, right) => Number(right.state === "running") - Number(left.state === "running"));
   const currentEstimate = (section: WatchSection): number | undefined => {
     const queue = section.queue;
     if (!queue) return undefined;
-    const current = queue.items.find(item => ["running", "waiting", "interrupted"].includes(item.state));
+    const queueItems = runningFirst(queue.items);
+    const current = queueItems.find(item => ["running", "waiting", "interrupted"].includes(item.state));
     if (!current) return 0;
     const estimate = queue.timing?.estimateMs ?? queue.timing?.averageMs;
     if (estimate === undefined) return undefined;
@@ -154,7 +160,8 @@ export function renderWatch(sections: WatchSection[], width = 100, colors = fals
     if (section.error) lines.push(line(section.error, "red"));
     const queue = section.queue;
     if (!queue) continue;
-    const current = queue.items.find(item => ["running", "waiting", "interrupted"].includes(item.state));
+    const queueItems = runningFirst(queue.items);
+    const current = queueItems.find(item => ["running", "waiting", "interrupted"].includes(item.state));
     const sampleCount = queue.timing?.sampleCount ?? 0;
     const averageMs = queue.timing?.averageMs;
     const estimateMs = queue.timing?.estimateMs ?? averageMs;
@@ -216,8 +223,8 @@ export function renderWatch(sections: WatchSection[], width = 100, colors = fals
       ["EWMA", duration(queue.timing?.ewmaMs), "yellow"],
       ["TRIMMED MEAN", duration(queue.timing?.trimmedMeanMs), "yellow"],
       ["RATE", throughput === undefined ? "--" : `${throughput.toFixed(2)} tasks/h`, "cyan"],
-      ["MIN", duration(queue.timing?.minMs), "cyan"],
-      ["MAX", duration(queue.timing?.maxMs), "cyan"],
+      ["SHORTEST", duration(queue.timing?.minMs), "cyan"],
+      ["LONGEST", duration(queue.timing?.maxMs), "cyan"],
       ["STDDEV", duration(queue.timing?.standardDeviationMs), "cyan"],
       ["CV", variation === undefined ? "--" : `${Math.round(variation * 100)}%`, "cyan"],
       ["RECENT P50", duration(queue.timing?.recentMedianMs), "cyan"],
@@ -255,10 +262,10 @@ export function renderWatch(sections: WatchSection[], width = 100, colors = fals
     // filter implementation rescanned the full queue for every row (O(n^2)),
     // which made --watch expensive precisely when it was most needed.
     let activeBefore = 0;
-    const waiting = queue.items.flatMap(item => {
+    const waiting = queueItems.map(item => {
       const aheadCount = item.state === "queued" ? activeBefore : undefined;
       if (["running", "interrupted", "queued"].includes(item.state)) activeBefore += 1;
-      return item === current ? [] : [{ item, aheadCount }];
+      return { item, aheadCount };
     });
     const wide = columns >= 90;
     const positionWidth = columns >= 30 ? Math.max(4, ...waiting.map(({ item }) => String(item.position ?? "-").length + 1)) : 0;
@@ -301,7 +308,7 @@ export function renderWatch(sections: WatchSection[], width = 100, colors = fals
     lines.push(queueBorder("┌", "┬", "┐"));
     lines.push(bold(row("POS", "STATE", "AHEAD", "START IN", "TASK", "cyan"), colors));
     lines.push(queueBorder("├", "┼", "┤"));
-    if (!waiting.length) lines.push(line("  No other queued tasks."));
+    if (!waiting.length) lines.push(line("  No queued tasks."));
     for (const { item, ahead, eta } of rowData) lines.push(row(String(item.position ?? "-"), item.state, ahead, eta, item.title, stateColor(item.state)));
     lines.push(queueBorder("└", "┴", "┘"));
   }

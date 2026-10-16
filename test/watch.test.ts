@@ -56,6 +56,23 @@ test("watch shows interrupted current task before queued work and separates work
   assert.match(colored, /\x1b\[35m \| LEFT/);
 });
 
+test("watch queue table always shows the running task as its first record", () => {
+  const queue = { workspace: "/one", running: 1, queued: 2, completed: 0, failed: 0, items: [
+    { state: "queued", title: "Waiting first in response", position: 2 },
+    { state: "running", title: "Actually running", position: 1 },
+    { state: "queued", title: "Waiting second", position: 3 }
+  ] } as QueueStatus;
+  const output = renderWatch([{ workspace: "/one", queue }], 120);
+  const tableHeader = output.indexOf("│POS");
+  const runningRow = output.indexOf("Actually running", tableHeader);
+  const firstQueuedRow = output.indexOf("Waiting first in response", tableHeader);
+
+  assert.ok(tableHeader >= 0);
+  assert.ok(runningRow > tableHeader);
+  assert.ok(runningRow < firstQueuedRow);
+  assert.match(output.slice(runningRow, output.indexOf("\n", runningRow)), /running/);
+});
+
 test("watch displays per-task, workspace, and global managed token usage", () => {
   const first = { input: 1_000_000, output: 20_000, total: 1_020_000, cacheReads: 10_000, cacheWrites: 2_000, sessions: 1 };
   const second = { input: 2_000_000, output: 30_000, total: 2_030_000, cacheReads: 0, cacheWrites: 0, sessions: 2 };
@@ -188,7 +205,7 @@ test("watch exposes distribution, throughput, variability, and trend metrics", (
     trend: "slower", confidence: "medium"
   }, items: [] } as QueueStatus;
   const output = renderWatch([{ workspace: "/one", queue }], 180, false);
-  assert.match(output, /MIN\s+│MAX\s+│STDDEV\s+│CV/);
+  assert.match(output, /SHORTEST\s+│LONGEST\s+│STDDEV\s+│CV/);
   assert.match(output, /00:10:00\s+│01:30:00\s+│00:20:00\s+│67%/);
   assert.match(output, /RATE/);
   assert.match(output, /2\.00 tasks\/h/);

@@ -31,9 +31,47 @@ interface RestartLeaseProtection {
   until: number;
 }
 
+export interface CompanionFailureState {
+  pid: number;
+  failures: number;
+  since: number;
+  lastError: string;
+}
+
 export const YOLO_RESTART_LEASE_GRACE_MS = 2 * 60_000;
 export const UNEXPECTED_CLOSE_GRACE_MS = 15_000;
 export const UNEXPECTED_CLOSE_REOPEN_COOLDOWN_MS = 60_000;
+export const UNRESPONSIVE_COMPANION_GRACE_MS = 30_000;
+export const UNRESPONSIVE_COMPANION_FAILURES = 5;
+export const UNRESPONSIVE_COMPANION_RESTART_COOLDOWN_MS = 2 * 60_000;
+
+export function nextCompanionFailure(
+  previous: CompanionFailureState | undefined,
+  registration: Pick<WorkspaceRegistration, "pid">,
+  message: string,
+  now = Date.now()
+): CompanionFailureState {
+  return previous?.pid === registration.pid
+    ? { ...previous, failures: previous.failures + 1, lastError: message }
+    : { pid: registration.pid, failures: 1, since: now, lastError: message };
+}
+
+/** Only a full Unix-socket accept backlog is strong enough evidence for an
+ * automatic host restart. Cline legitimately blocks its extension event loop
+ * for tens of seconds during large tasks, so a generic timeout is diagnostic
+ * only and must never reload VS Code. */
+export function companionFailureIsRestartable(message: string): boolean {
+  return /(?:^|\s)(?:connect\s+)?EAGAIN(?:\s|$)/u.test(message);
+}
+
+export function companionRecoveryReady(
+  failure: CompanionFailureState | undefined,
+  now = Date.now(),
+  graceMs = UNRESPONSIVE_COMPANION_GRACE_MS,
+  minimumFailures = UNRESPONSIVE_COMPANION_FAILURES
+): boolean {
+  return Boolean(failure && failure.failures >= minimumFailures && now - failure.since >= graceMs);
+}
 
 export function unexpectedlyClosedQueueWorkspaces(
   queues: ReadonlyArray<{ workspace: string; queueLength: number; paused?: boolean }>,
@@ -125,6 +163,9 @@ export class ClineConsoleService {
   private readonly missingWorkspaceSince = new Map<string, number>();
   private readonly workspaceReopenAttemptedAt = new Map<string, number>();
   private readonly workspaceReopensInFlight = new Set<string>();
+  private readonly companionFailures = new Map<string, CompanionFailureState>();
+  private readonly companionRestartAttemptedAt = new Map<string, number>();
+  private readonly companionRestartsInFlight = new Set<string>();
 
   private readonly legacyRequestDirectory?: string;
 
@@ -220,6 +261,7 @@ export class ClineConsoleService {
         for (const name of names.filter(value => /^restart-[0-9a-f-]+\.json$/.test(value))) await this.handleRestartRequest(path.join(this.directory, name));
         await this.arbitrateLmStudioQueues();
         await this.detectUnexpectedlyClosedWorkspaces();
+        await this.recoverUnresponsiveQueueCompanions();
       } catch (error) {
         if (!this.recoveryAbort.signal.aborted) this.logger.error(`YOLO restart monitor failed safely: ${errorMessage(error)}`);
       }
@@ -266,6 +308,54 @@ export class ClineConsoleService {
       history.recordEvent(workspace, { type, source: "cline-console", observed: true, payload });
     } catch (error) { this.logger.error(`Failed to record workspace recovery event: ${errorMessage(error)}`); }
     finally { history?.close(); }
+  }
+
+  private async recoverUnresponsiveQueueCompanions(): Promise<void> {
+    const [registrations, queues] = await Promise.all([
+      loadRegistrations(this.directory),
+      discoverPersistedQueueStatuses(queueStateDirectory())
+    ]);
+    const activeQueues = new Map(queues
+      .filter(queue => queue.queueLength > 0 && queue.paused !== true)
+      .map(queue => [path.resolve(queue.workspace), queue]));
+    const now = Date.now();
+    for (const registration of registrations) {
+      const workspace = path.resolve(registration.workspace);
+      const failure = this.companionFailures.get(workspace);
+      if (!activeQueues.has(workspace) || failure?.pid !== registration.pid || !companionRecoveryReady(failure, now)
+        || !companionFailureIsRestartable(failure.lastError)) continue;
+      if (this.companionRestartsInFlight.has(workspace)) continue;
+      const attemptedAt = this.companionRestartAttemptedAt.get(workspace) ?? 0;
+      if (now - attemptedAt < UNRESPONSIVE_COMPANION_RESTART_COOLDOWN_MS) continue;
+      const command = await readProcessCommand(registration.pid);
+      if (!isSafeCodeExtensionHostCommand(command)) {
+        this.logger.error(`Refusing automatic companion recovery for ${workspace}: PID ${registration.pid} is not a verified VS Code extension host.`);
+        this.companionRestartAttemptedAt.set(workspace, now);
+        continue;
+      }
+      const queue = activeQueues.get(workspace);
+      const sessionId = queue?.items.find(item => item.state === "running")?.sessionId;
+      if (sessionId) this.restartLeaseProtections.set(workspace, { sessionId, until: Number.POSITIVE_INFINITY });
+      this.companionRestartAttemptedAt.set(workspace, now);
+      this.companionRestartsInFlight.add(workspace);
+      this.recordWorkspaceRecoveryEvent(workspace, "unresponsive_companion_detected", {
+        pid: registration.pid, failures: failure.failures, unresponsiveForMs: now - failure.since, error: failure.lastError
+      });
+      this.logger.error(`Unresponsive queue companion detected for ${workspace}: ${failure.failures} failures over ${now - failure.since}ms (${failure.lastError}). Restarting verified extension host ${registration.pid}.`);
+      void restartExtension(registration).then(replacement => {
+        this.companionFailures.delete(workspace);
+        if (sessionId) this.restartLeaseProtections.set(workspace, { sessionId, until: Date.now() + YOLO_RESTART_LEASE_GRACE_MS });
+        this.recordWorkspaceRecoveryEvent(workspace, "unresponsive_companion_restarted", {
+          previousPid: registration.pid, replacementPid: replacement.pid, failures: failure.failures
+        });
+        this.logger.info(`Automatically restarted unresponsive queue companion for ${workspace} as PID ${replacement.pid}.`);
+      }).catch(error => {
+        this.recordWorkspaceRecoveryEvent(workspace, "unresponsive_companion_restart_failed", {
+          pid: registration.pid, failures: failure.failures, error: errorMessage(error)
+        });
+        this.logger.error(`Automatic unresponsive companion recovery failed for ${workspace}: ${errorMessage(error)}`);
+      }).finally(() => this.companionRestartsInFlight.delete(workspace));
+    }
   }
 
   private async arbitrateLmStudioQueues(): Promise<void> {
@@ -383,8 +473,16 @@ export class ClineConsoleService {
       const response = await requestOverSocket(registration.socketPath, makeRequest("activity", registration.workspace), 2_500);
       if (!response.ok || !response.result || typeof response.result !== "object") return undefined;
       const activity = response.result as WorkspaceActivity;
+      this.companionFailures.delete(path.resolve(registration.workspace));
       return { workspace: registration.workspace, socketPath: registration.socketPath, ...activity };
     } catch (error) {
+      const workspace = path.resolve(registration.workspace);
+      const message = errorMessage(error);
+      if (companionFailureIsRestartable(message)) {
+        this.companionFailures.set(workspace, nextCompanionFailure(this.companionFailures.get(workspace), registration, message));
+      } else {
+        this.companionFailures.delete(workspace);
+      }
       this.logger.debug(`Model arbitration skipped unavailable workspace ${registration.workspace}: ${errorMessage(error)}`);
       return undefined;
     }

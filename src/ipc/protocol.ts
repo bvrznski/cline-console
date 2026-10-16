@@ -5,7 +5,7 @@ import type { Action, IpcRequest, IpcResponse } from "./types";
 
 export const DEFAULT_IPC_REQUEST_TIMEOUT_MS = 30_000;
 export const QUEUE_MUTATION_TIMEOUT_MS = 10 * 60_000;
-const LONG_QUEUE_ACTIONS = new Set<Action>(["enqueueTasks", "enqueueMessages", "replaceQueue", "clearQueue", "clearWorkspace", "popQueue", "trimQueue"]);
+const LONG_QUEUE_ACTIONS = new Set<Action>(["enqueueTasks", "enqueueMessages", "replaceQueue", "clearQueue", "clearWorkspace", "cleanQueue", "purgeQueue", "popQueue", "trimQueue"]);
 
 export function ipcRequestTimeout(action: Action): number {
   return LONG_QUEUE_ACTIONS.has(action) ? QUEUE_MUTATION_TIMEOUT_MS : DEFAULT_IPC_REQUEST_TIMEOUT_MS;
@@ -27,7 +27,7 @@ export function parseRequest(line: string): IpcRequest {
   if (typeof request.requestId !== "string" || !request.requestId) throw new ClineConsoleError("INVALID_REQUEST", "requestId is required.");
   const action = request.action;
   if (typeof action !== "string") throw new ClineConsoleError("INVALID_REQUEST", "action must be a string.");
-  const validActions: Action[] = ["newTask", "reloadTask", "resumeHistoryTask", "resumePreemptedQueueTask", "finishUnfinishedTasks", "confirmCompletion", "skipWaitingTask", "sendMessage", "cancelTask", "preemptQueueTask", "status", "capabilities", "enqueueTasks", "enqueueMessages", "replaceQueue", "clearQueue", "clearWorkspace", "popQueue", "trimQueue", "pauseQueue", "resumeQueue", "continueQueue", "relaunchQueue", "queueStatus", "enqueueContext", "activity", "ping"];
+  const validActions: Action[] = ["newTask", "reloadTask", "resumeHistoryTask", "resumePreemptedQueueTask", "finishUnfinishedTasks", "confirmCompletion", "skipWaitingTask", "advanceQueue", "cleanQueue", "purgeQueue", "sendMessage", "cancelTask", "preemptQueueTask", "status", "capabilities", "enqueueTasks", "enqueueMessages", "replaceQueue", "clearQueue", "clearWorkspace", "popQueue", "trimQueue", "pauseQueue", "resumeQueue", "continueQueue", "relaunchQueue", "queueStatus", "enqueueContext", "activity", "ping"];
   if (!validActions.includes(action)) throw new ClineConsoleError("INVALID_ACTION", `Unknown action: ${action}. Valid actions are: ${validActions.join(", ")}.`);
   if (typeof request.workspace !== "string" || !request.workspace) throw new ClineConsoleError("INVALID_WORKSPACE", "workspace is required.");
   return { protocolVersion: request.protocolVersion, requestId: request.requestId, action, workspace: request.workspace, payload: request.payload } as IpcRequest;

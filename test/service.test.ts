@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { Logger } from "../src/common/logging";
-import { ClineConsoleService, isSafeCodeExtensionHostCommand, modelLeaseOccupied, modelRestorationReady, probeService, readEnqueueContext, recoverRestartArtifacts, removeExpiredRestartArtifacts, restartLeaseActive, selectModelQueueWinner, selectOrphanedModelQueue, unexpectedlyClosedQueueWorkspaces, updatePreviousRunningSessions, YOLO_RESTART_LEASE_GRACE_MS, type ModelQueueObservation } from "../src/service/daemon";
+import { ClineConsoleService, companionFailureIsRestartable, companionRecoveryReady, isSafeCodeExtensionHostCommand, modelLeaseOccupied, modelRestorationReady, nextCompanionFailure, probeService, readEnqueueContext, recoverRestartArtifacts, removeExpiredRestartArtifacts, restartLeaseActive, selectModelQueueWinner, selectOrphanedModelQueue, unexpectedlyClosedQueueWorkspaces, updatePreviousRunningSessions, YOLO_RESTART_LEASE_GRACE_MS, type ModelQueueObservation } from "../src/service/daemon";
 
 const logger: Logger = { error() {}, info() {}, debug() {} };
 
@@ -43,6 +43,22 @@ test("unexpected-close detector selects only active queues without a companion",
     { workspace: "/active-online", queueLength: 1 }
   ];
   assert.deepEqual(unexpectedlyClosedQueueWorkspaces(queues, [{ workspace: "/active-online" }]), ["/active-offline"]);
+});
+
+test("unresponsive companion recovery requires sustained failures and resets for a replacement PID", () => {
+  assert.equal(companionFailureIsRestartable("connect EAGAIN /run/user/1000/cline-console/workspace.sock"), true);
+  assert.equal(companionFailureIsRestartable("Timed out waiting for the VS Code extension."), false);
+  assert.equal(companionFailureIsRestartable("connect ECONNREFUSED /tmp/workspace.sock"), false);
+  const registration = { pid: 101 };
+  let failure = nextCompanionFailure(undefined, registration, "connect EAGAIN", 1_000);
+  for (let count = 1; count < 5; count += 1) failure = nextCompanionFailure(failure, registration, "connect EAGAIN", 2_000 + count);
+  assert.equal(failure.failures, 5);
+  assert.equal(companionRecoveryReady(failure, 30_999, 30_000, 5), false);
+  assert.equal(companionRecoveryReady(failure, 31_000, 30_000, 5), true);
+
+  const replacementFailure = nextCompanionFailure(failure, { pid: 202 }, "timeout", 40_000);
+  assert.deepEqual(replacementFailure, { pid: 202, failures: 1, since: 40_000, lastError: "timeout" });
+  assert.equal(companionRecoveryReady(replacementFailure, 80_000, 30_000, 5), false);
 });
 
 test("newly resumed workspace acquires a shared model without heartbeat ping-pong", () => {

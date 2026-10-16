@@ -98,6 +98,20 @@ export function normalizeCommand(input: Parsed): NormalizedCommand {
   if (input.command === "queue") {
     const action = args[0];
     if (action === "list") return { parsed: { ...input, commandArgs: args.slice(1) } };
+    if (action === "--next" || action === "next") {
+      if (args.length !== 1) throw new Error("queue --next accepts no additional arguments.");
+      return { parsed: { ...input, commandArgs: ["next"] } };
+    }
+    if (action === "--clear" || action === "clear") {
+      if (args.length !== 1) throw new Error("queue --clear accepts no additional arguments.");
+      return { parsed: { ...input, commandArgs: ["clear"] } };
+    }
+    if (action === "--purge" || action === "purge") {
+      const purgeArgs = args.slice(1);
+      const force = removeFlag(purgeArgs, "--force");
+      if (purgeArgs.length) throw new Error("queue --purge accepts only the optional --force flag.");
+      return { parsed: { ...input, commandArgs: ["purge", ...(force ? ["--force"] : [])] } };
+    }
     if (action === "add") {
       const actionArgs = args.slice(1);
       const resumeAfter = removeFlag(actionArgs, "--resume");

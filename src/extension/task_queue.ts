@@ -273,6 +273,67 @@ export class TaskQueue {
     return result;
   }
 
+  async advanceToNext(): Promise<{ advanced: boolean; skipped?: { id: string; title: string }; queueLength: number }> {
+    this.abortController.abort();
+    await Promise.all([this.worker, this.policyWorker]);
+    this.abortController = new AbortController();
+    const item = this.data.items.find(candidate => candidate.state === "running");
+    if (!item) {
+      const latest = await getLegacyWorkspaceSessionStatus(this.workspace);
+      if (latest?.sessionId && this.ownsSession(latest.sessionId) && (latest.status === "running" || latest.status === "waiting")) {
+        try {
+          await this.adapter.interruptTask();
+          this.rememberDispatchExemption(latest.sessionId);
+        } catch (error) {
+          this.kick();
+          this.startPolicyMonitor();
+          throw error;
+        }
+      }
+      this.data.paused = false;
+      await this.persist();
+      const queueLength = this.data.items.filter(candidate => candidate.state === "queued").length;
+      this.kick();
+      this.startPolicyMonitor();
+      return { advanced: queueLength > 0, queueLength };
+    }
+
+    const activity = item.kind === "message" ? undefined : await this.currentOwnedActivity();
+    if (activity?.sessionId) {
+      if (!this.ownsSession(activity.sessionId)) {
+        this.startPolicyMonitor();
+        throw new ClineConsoleError("TASK_NOT_OWNED", "Refusing to skip a Cline task not created by cline-console.");
+      }
+      try {
+        await this.adapter.interruptTask();
+      } catch (error) {
+        this.kick();
+        this.startPolicyMonitor();
+        throw error;
+      }
+      this.rememberDispatchExemption(activity.sessionId);
+    } else {
+      this.rememberDispatchExemption(item.sessionId);
+    }
+
+    this.pauseTaskTimer(item);
+    item.state = queueStateTransition(item.state, "skipped");
+    item.finishedAt = new Date().toISOString();
+    item.error = "Skipped by explicit queue --next request.";
+    this.data.paused = false;
+    await this.persist();
+    this.recordHistoryEvent({ type: "queue_task_skipped_by_user", source: "cli", observed: true, taskId: item.id, queueItemId: item.id, clineSessionId: activity?.sessionId ?? item.sessionId, payload: { sourcePath: item.sourcePath } });
+    const result = {
+      advanced: this.data.items.some(candidate => candidate.state === "queued"),
+      skipped: { id: item.id, title: firstLine(item.prompt) },
+      queueLength: this.data.items.filter(candidate => candidate.state === "queued").length
+    };
+    await this.resetFinishedQueueLifecycle();
+    this.kick();
+    this.startPolicyMonitor();
+    return result;
+  }
+
   async replace(tasks: Array<{ sourcePath: string; prompt: string; reflective?: boolean; scopePath?: string }>): Promise<{ queued: number; replaced: number; queueLength: number }> {
     const replaced = this.data.items.filter(item => item.state === "queued").length;
     const retained = this.data.items.filter(item => item.state !== "queued");
@@ -287,6 +348,25 @@ export class TaskQueue {
   historySelectors(): { prompts: string[]; taskIds: string[] } {
     const taskItems = this.data.items.filter(item => (item.kind ?? "task") === "task");
     return { prompts: [...new Set(taskItems.map(item => item.prompt))], taskIds: [...new Set(taskItems.flatMap(item => item.sessionId ? [item.sessionId] : []))] };
+  }
+
+  async cleanFinished(): Promise<{ cleared: number; completed: number; failed: number; skipped: number; queueLength: number }> {
+    const completed = this.data.items.filter(item => item.state === "completed").length;
+    const failed = this.data.items.filter(item => item.state === "failed").length;
+    const skipped = this.data.items.filter(item => item.state === "skipped").length;
+    const terminalIds = new Set(this.data.items.filter(item => item.state === "completed" || item.state === "failed" || item.state === "skipped").map(item => item.id));
+    if (terminalIds.size) {
+      this.data.items = this.data.items.filter(item => !terminalIds.has(item.id));
+      await this.persist();
+      this.logger.info(`Cleaned ${terminalIds.size} terminal queue record(s) from ${this.workspace}; active work was preserved.`);
+    }
+    return {
+      cleared: terminalIds.size,
+      completed,
+      failed,
+      skipped,
+      queueLength: this.data.items.filter(item => item.state === "queued" || item.state === "running").length
+    };
   }
 
   async clear(clearHistory?: (selectors: { prompts: string[]; taskIds: string[] }) => Promise<number>): Promise<{ cleared: number; clearedWaiting: number; clearedStaleRunning: number; queueLength: number; runningPreserved: boolean; historyDeleted: number }> {

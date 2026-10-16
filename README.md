@@ -1,6 +1,78 @@
-# cline-console
+# Cline Console
 
-### Live terminal dashboard
+<p align="center">
+  <strong>A durable terminal control plane for Cline in VS Code.</strong><br>
+  Queue long-running agent work, supervise multiple workspaces, recover interrupted
+  tasks, and observe execution without replacing Cline's native runtime.
+</p>
+
+<p align="center">
+  <img alt="Version 0.13.0" src="https://img.shields.io/badge/version-0.13.0-2563eb">
+  <img alt="Linux" src="https://img.shields.io/badge/platform-Linux-f59e0b">
+  <img alt="Node.js 22.5+" src="https://img.shields.io/badge/node-%E2%89%A522.5-339933">
+  <img alt="VS Code 1.101+" src="https://img.shields.io/badge/VS_Code-%E2%89%A51.101-007ACC">
+  <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-16a34a">
+</p>
+
+> [!IMPORTANT]
+> Cline Console orchestrates the Cline extension already running in VS Code.
+> Cline remains responsible for models, credentials, approvals, checkpoints,
+> tools, terminals, and the visible task interface.
+
+```text
+cline-console CLI
+        │
+        ▼
+systemd user service ── durable queue and SQLite audit history
+        │
+        ▼
+workspace companion ── exact VS Code window and filesystem workspace
+        │
+        ▼
+Cline extension ── task execution, approvals, tools, and UI
+```
+
+## Why Cline Console?
+
+Cline is excellent at executing one interactive task. Cline Console adds the
+operational layer needed for unattended or multi-stage work:
+
+- persistent FIFO queues that survive terminal, VS Code, and Linux restarts;
+- exact workspace routing with durable ownership boundaries;
+- guarded completion verification and same-thread follow-up work;
+- interruption, timeout, YOLO-failure, and companion-disconnect recovery;
+- model-aware arbitration between queues sharing one LM Studio model;
+- a responsive, colored `--watch` dashboard with timing and token telemetry;
+- structured SQLite history without prompt bodies in operational logs.
+
+## Quick navigation
+
+- [Install from source](#install-from-source)
+- [Five-minute start](#five-minute-start)
+- [Live dashboard](#live-dashboard)
+- [Command reference](#command-reference)
+- [Completion safety](#completion-safety)
+- [Persistence and security](#persistence-and-security)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+
+## Live dashboard
+
+```bash
+# One workspace
+cline-console -w ~/Gordon --watch
+
+# Every workspace with active queue work
+cline-console --watch
+```
+
+The dashboard is deliberately compact and expands to the current terminal
+width. It places the running task first, then shows queued work and live
+estimates such as `CURRENT ELAPSED`, `CURRENT LEFT`, `QUEUE ETA`, `END`,
+`SHORTEST`, and `LONGEST`. Press `j`/`k` or the arrow keys to scroll and `q` to
+exit. Watching is read-only: it never starts tasks or triggers recovery.
+
+### Dashboard behavior and estimates
 
 Use `cline-console -w ~/rebuntu --watch` for one workspace, or
 `cline-console --watch` for all registered workspaces separated by
@@ -44,6 +116,8 @@ Refresh is every two seconds after each bounded status poll.
 Use `j`/`k` or arrow keys to scroll and `q`/Ctrl+C to exit. `--no-color` disables
 colors; redirected output produces one plain snapshot. Offline queue snapshots
 are explicitly labeled. Watching never starts tasks or triggers recovery.
+
+## Automation and safety
 
 Completion reports may include a Markdown `Deferred Work Ledger` section with
 the declaration `Work intentionally deferred to later phases`. That section,
@@ -101,26 +175,9 @@ as given; missing-path errors list searched locations. Directory inputs and
 to the current directory or the directory included in their start argument.
 `--workspace` selects the destination queue.
 
-`cline-console` controls the Cline extension running inside VS Code from a
-terminal. It can start tasks, send follow-up messages, inspect task state, and
-run persistent per-workspace FIFO queues.
-
-```text
-terminal CLI
-    -> singleton user service
-        -> selected VS Code workspace companion
-            -> Cline extension API
-                -> Cline task, provider, approvals, tools, and UI
-```
-
-`cline-console` is a control plane, not an alternative agent runtime. It does
-not call model providers directly, duplicate Cline's task loop, or use the
-standalone Cline CLI. Cline remains responsible for credentials, models,
-checkpoints, approvals, terminals, browser tools, and visible task execution.
-
-The project is pre-1.0, Linux-oriented, and currently verified with Node.js
-18+, VS Code, systemd user services, and Cline Legacy 4.1.7. It is independent
-and is not affiliated with or endorsed by Cline or its maintainers.
+The project is pre-1.0, Linux-oriented, and currently verified with Cline
+Legacy 4.1.7. It is independent and is not affiliated with or endorsed by
+Cline or its maintainers.
 
 ## Features
 
@@ -140,8 +197,8 @@ and is not affiliated with or endorsed by Cline or its maintainers.
 ## Requirements
 
 - Linux with systemd user services
-- Node.js 18 or newer
-- VS Code 1.85 or newer
+- Node.js 22.5 or newer
+- VS Code 1.101 or newer
 - A compatible Cline extension; Cline Legacy 4.1.7 is the verified target
 
 ## Install from source
@@ -174,7 +231,7 @@ cline-console workspace list
 man cline-console
 ```
 
-## Quick start
+## Five-minute start
 
 Open the target repository in VS Code, then start a task:
 
@@ -283,10 +340,12 @@ cline-console -w /repo queue list --json
 cline-console -w /repo queue pause
 cline-console -w /repo queue resume
 cline-console -w /repo queue trim 2
+cline-console -w /repo queue --next
 cline-console -w /repo --continue
 cline-console -w /repo --relaunch
-cline-console -w /repo queue clear
-cline-console -w /repo queue clear --force
+cline-console -w /repo queue --clear
+cline-console -w /repo queue --purge
+cline-console -w /repo queue --purge --force
 
 # Remove one waiting entry
 cline-console -w /repo queue remove --file /absolute/path/to/task.md
@@ -569,11 +628,13 @@ replacement suppresses stale `continue` delivery to its predecessor.
 
 #### Clearing queues and history
 
-`queue clear` removes all waiting and running cline-console queue entries but
-does not alter Cline history or cancel the displayed Cline task. Only
-`queue clear --force` additionally cancels an exact queue match and deletes its
-matching Cline history records and per-task storage. Unrelated manual tasks and
-other workspaces are preserved.
+`queue --clear` removes only retained terminal queue records (`completed`,
+`failed`, and `skipped`, including records displayed as `closed`). Running and
+waiting work is preserved. `queue --purge` removes all waiting and running
+cline-console queue entries but does not alter Cline history. Only
+`queue --purge --force` additionally cancels an exact queue match and deletes
+its matching Cline history records and per-task storage. Unrelated manual tasks
+and other workspaces are preserved.
 
 ### Workspaces
 
@@ -587,7 +648,7 @@ discover persisted queues whose companions are temporarily offline.
 
 `workspace clear` clears cline-console queue state for the selected workspace.
 It does not alter Cline history; history deletion is reserved exclusively for
-`queue clear --force`.
+`queue --purge --force`.
 
 ### Durable history database
 

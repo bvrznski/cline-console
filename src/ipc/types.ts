@@ -1,4 +1,4 @@
-export type Action = "newTask" | "reloadTask" | "resumeHistoryTask" | "resumePreemptedQueueTask" | "finishUnfinishedTasks" | "confirmCompletion" | "skipWaitingTask" | "sendMessage" | "cancelTask" | "preemptQueueTask" | "status" | "capabilities" | "enqueueTasks" | "enqueueMessages" | "replaceQueue" | "clearQueue" | "clearWorkspace" | "popQueue" | "trimQueue" | "pauseQueue" | "resumeQueue" | "continueQueue" | "relaunchQueue" | "queueStatus" | "enqueueContext" | "activity" | "ping";
+export type Action = "newTask" | "reloadTask" | "resumeHistoryTask" | "resumePreemptedQueueTask" | "finishUnfinishedTasks" | "confirmCompletion" | "skipWaitingTask" | "advanceQueue" | "cleanQueue" | "purgeQueue" | "sendMessage" | "cancelTask" | "preemptQueueTask" | "status" | "capabilities" | "enqueueTasks" | "enqueueMessages" | "replaceQueue" | "clearQueue" | "clearWorkspace" | "popQueue" | "trimQueue" | "pauseQueue" | "resumeQueue" | "continueQueue" | "relaunchQueue" | "queueStatus" | "enqueueContext" | "activity" | "ping";
 
 export interface TokenUsage {
   input: number;

@@ -9,7 +9,7 @@ import type { ClineAdapter } from "../integrations/cline/types";
 import type { TaskQueue } from "./task_queue";
 import { getLatestLegacyWorkspaceTaskPrompt, getLegacyWorkspaceActivity, getLegacyWorkspaceSessionStatus, reconcileLegacyStatus } from "../integrations/cline/completion_monitor";
 import { deleteLegacyQueuedTaskHistory, getLegacyUnfinishedWorkspaceTasks } from "../integrations/cline/task_history";
-import { attachTokenUsage } from "../integrations/cline/token_usage";
+import { attachTokenUsage, readClineTokenUsage } from "../integrations/cline/token_usage";
 import { TaskModelIdentityCache } from "./lmstudio_ready";
 import { ensureRuntimeDirectory, ownsWorkspaceRegistration, registerWorkspace, socketPath, unregisterWorkspace, workspaceId } from "./workspace_registry";
 import type { HistoryStore } from "../history/history_store";
@@ -19,6 +19,7 @@ export class IpcServer {
   private registration?: WorkspaceRegistration;
   private queueStatusRefresh?: Promise<QueueStatus>;
   private queueStatusCache?: { at: number; value: QueueStatus };
+  private tokenUsageRefreshedAt = 0;
   private readonly taskModelIdentity = new TaskModelIdentityCache();
 
   constructor(private readonly directory: string, private readonly workspace: string, private readonly adapter: ClineAdapter, private readonly logger: Logger, private readonly queue?: TaskQueue, private readonly history?: HistoryStore) {}
@@ -137,6 +138,16 @@ export class IpcServer {
           result = await this.queue.skipWaitingTask(requiredText(request.payload?.sessionId, "sessionId"));
           break;
         }
+        case "advanceQueue": {
+          if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
+          result = await this.queue.advanceToNext();
+          break;
+        }
+        case "cleanQueue": {
+          if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
+          result = await this.queue.cleanFinished();
+          break;
+        }
         case "sendMessage": {
           const activity = await getLegacyWorkspaceActivity(expected);
           if (!this.queue?.ownsSession(activity.sessionId)) throw new ClineConsoleError("TASK_NOT_OWNED", "Refusing to message a Cline task not created by cline-console.");
@@ -204,6 +215,16 @@ export class IpcServer {
           break;
         }
         case "clearQueue": {
+          if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
+          const clearHistory = request.payload?.force === true ? async (selectors: { prompts: string[]; taskIds: string[] }) => {
+            const latest = await getLatestLegacyWorkspaceTaskPrompt(expected);
+            if (latest && (selectors.taskIds.includes(latest.sessionId) || selectors.prompts.includes(latest.prompt))) await this.adapter.cancelTask();
+            return (await deleteLegacyQueuedTaskHistory(expected, selectors.prompts, selectors.taskIds)).deleted;
+          } : undefined;
+          result = await this.queue.clear(clearHistory);
+          break;
+        }
+        case "purgeQueue": {
           if (!this.queue) throw new ClineConsoleError("QUEUE_UNAVAILABLE", "Task queue is unavailable.");
           const clearHistory = request.payload?.force === true ? async (selectors: { prompts: string[]; taskIds: string[] }) => {
             const latest = await getLatestLegacyWorkspaceTaskPrompt(expected);
@@ -312,12 +333,17 @@ export class IpcServer {
     this.queueStatusRefresh = (async () => {
       const ownedSessionIds = this.queue!.ownedSessionIds();
       // queueStatus is the hot path used by --watch. It must remain a passive
-      // projection of already-owned state: querying Cline here causes its
-      // Legacy UI to rebuild large task presentations on every poll and can
-      // starve the queue worker. The worker is the sole authority that observes
-      // Cline activity and refreshes retained telemetry.
+      // projection of already-owned state. Reading Cline's persisted telemetry
+      // does not touch its UI, but parsing the history file on every watch poll
+      // is expensive, so refresh it at most once per interval and retain the
+      // last observed maxima for sessions no longer present in live history.
+      let retained = this.queue!.getRetainedTokenUsage();
+      if (Date.now() - this.tokenUsageRefreshedAt >= TOKEN_USAGE_REFRESH_INTERVAL_MS) {
+        retained = await this.queue!.retainTokenUsage(await readClineTokenUsage(ownedSessionIds));
+        this.tokenUsageRefreshedAt = Date.now();
+      }
       void workspace;
-      const value = attachTokenUsage(this.queue!.getStatus(), this.queue!.getRetainedTokenUsage(), ownedSessionIds);
+      const value = attachTokenUsage(this.queue!.getStatus(), retained, ownedSessionIds);
       this.queueStatusCache = { at: Date.now(), value };
       return value;
     })();
@@ -346,6 +372,8 @@ export class IpcServer {
     return this.registration !== undefined && await ownsWorkspaceRegistration(this.directory, this.registration);
   }
 }
+
+const TOKEN_USAGE_REFRESH_INTERVAL_MS = 30_000;
 
 const POLLING_ACTIONS = new Set<IpcRequest["action"]>(["ping", "activity", "status", "queueStatus", "enqueueContext"]);
 const READ_ONLY_ACTIONS = new Set<IpcRequest["action"]>([...POLLING_ACTIONS, "capabilities"]);

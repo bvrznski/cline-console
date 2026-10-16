@@ -266,7 +266,10 @@ test("model conflict pauses the queue without advancing its running head", async
 test("independent workspace queues dispatch concurrently", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-parallel-queues-"));
   const workspaces = [path.join(root, "one"), path.join(root, "two")];
-  await Promise.all(workspaces.map(workspace => fs.mkdir(workspace)));
+  const storage = path.join(root, "cline-storage");
+  await Promise.all([...workspaces.map(workspace => fs.mkdir(workspace)), fs.mkdir(path.join(storage, "state"), { recursive: true })]);
+  const previousStorage = process.env.CLINE_VSCODE_STORAGE_DIR;
+  process.env.CLINE_VSCODE_STORAGE_DIR = storage;
   const dispatched: string[] = [];
   const makeAdapter = (workspace: string): ClineAdapter => ({
     ...adapterWithStatus("none", "unknown"),
@@ -276,13 +279,18 @@ test("independent workspace queues dispatch concurrently", async () => {
     path.join(root, `queue-${index}.json`), workspace, makeAdapter(workspace), logger, undefined,
     { ...DEFAULT_TASK_SCANNER_OPTIONS, enabled: false, interTaskDelayMs: 0, terminalStabilityMs: 0 }
   ));
-  await Promise.all(queues.map(queue => queue.start()));
-  await Promise.all(queues.map((queue, index) => queue.enqueue([{ sourcePath: `/tasks/${index}`, prompt: `parallel-${index}` }])));
-  const deadline = Date.now() + 2_000;
-  while (dispatched.length < 2 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
-  assert.deepEqual(new Set(dispatched), new Set(workspaces));
-  await Promise.all(queues.map(queue => queue.stop()));
-  await fs.rm(root, { recursive: true });
+  try {
+    await Promise.all(queues.map(queue => queue.start()));
+    await Promise.all(queues.map((queue, index) => queue.enqueue([{ sourcePath: `/tasks/${index}`, prompt: `parallel-${index}` }])));
+    const deadline = Date.now() + 2_000;
+    while (dispatched.length < 2 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.deepEqual(new Set(dispatched), new Set(workspaces));
+  } finally {
+    if (previousStorage === undefined) delete process.env.CLINE_VSCODE_STORAGE_DIR;
+    else process.env.CLINE_VSCODE_STORAGE_DIR = previousStorage;
+    await Promise.all(queues.map(queue => queue.stop()));
+    await fs.rm(root, { recursive: true });
+  }
 });
 
 test("queue formatter displays active items without prompt bodies", () => {
@@ -545,6 +553,31 @@ test("queue clear removes a stale running entry when tasks is not active", async
   }
 });
 
+test("queue --clear removes only terminal records and preserves active work", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-queue-clean-")), file = path.join(root, "queue.json");
+  await fs.writeFile(file, JSON.stringify({ version: 1, workspace: "/repo", paused: true, items: [
+    { id: "closed", sourcePath: "/tasks/closed.md", prompt: "Closed", state: "completed", userConfirmedCompletion: true, queuedAt: "before", finishedAt: "now" },
+    { id: "failed", sourcePath: "/tasks/failed.md", prompt: "Failed", state: "failed", queuedAt: "before", finishedAt: "now" },
+    { id: "skipped", sourcePath: "/tasks/skipped.md", prompt: "Skipped", state: "skipped", queuedAt: "before", finishedAt: "now" },
+    { id: "active", sourcePath: "/tasks/active.md", prompt: "Active", state: "running", queuedAt: "before", dispatchedAt: "now" },
+    { id: "waiting", sourcePath: "/tasks/waiting.md", prompt: "Waiting", state: "queued", queuedAt: "now" }
+  ] }));
+  const queue = new TaskQueue(file, "/repo", adapterWithStatus("active", "running"), logger);
+  try {
+    await queue.start();
+    assert.deepEqual(await queue.cleanFinished(), { cleared: 3, completed: 1, failed: 1, skipped: 1, queueLength: 2 });
+    const persisted = JSON.parse(await fs.readFile(file, "utf8")) as { paused?: boolean; items: Array<{ id: string; state: string }> };
+    assert.equal(persisted.paused, true);
+    assert.deepEqual(persisted.items.map(item => ({ id: item.id, state: item.state })), [
+      { id: "active", state: "running" },
+      { id: "waiting", state: "queued" }
+    ]);
+  } finally {
+    await queue.stop();
+    await fs.rm(root, { recursive: true });
+  }
+});
+
 test("queue clear enforces removal of a running entry when tasks is active", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-queue-clear-active-")), file = path.join(root, "queue.json"), workspace = path.join(root, "workspace");
   await fs.mkdir(workspace);
@@ -613,6 +646,33 @@ test("DONE marks only the running queue task user-confirmed complete", async () 
       { id: "waiting", state: "queued", confirmed: false }
     ]);
     await assert.rejects(queue.confirmCompletion(), /No running queue task/);
+  } finally {
+    await queue.stop();
+    await fs.rm(root, { recursive: true });
+  }
+});
+
+test("queue --next records an explicit skip and releases the next item", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-next-")), file = path.join(root, "queue.json");
+  await fs.writeFile(file, JSON.stringify({ version: 1, workspace: "/repo", paused: true, items: [
+    { id: "active", kind: "message", sourcePath: "message:active", prompt: "Active message", targetSessionId: "owned", state: "running", queuedAt: "before", dispatchedAt: "now" },
+    { id: "waiting", sourcePath: "/tasks/waiting.md", prompt: "Waiting task", state: "queued", queuedAt: "now" }
+  ] }));
+  const queue = new TaskQueue(file, "/repo", adapterWithStatus("none", "unknown"), logger);
+  try {
+    await queue.start();
+    assert.deepEqual(await queue.advanceToNext(), {
+      advanced: true,
+      skipped: { id: "active", title: "Active message" },
+      queueLength: 1
+    });
+    const persisted = JSON.parse(await fs.readFile(file, "utf8")) as { paused?: boolean; items: Array<{ id: string; state: string; error?: string }> };
+    assert.equal(persisted.paused, false);
+    assert.deepEqual(persisted.items.map(item => ({ id: item.id, state: item.state })), [
+      { id: "active", state: "skipped" },
+      { id: "waiting", state: "queued" }
+    ]);
+    assert.match(persisted.items[0].error ?? "", /queue --next/);
   } finally {
     await queue.stop();
     await fs.rm(root, { recursive: true });
@@ -823,11 +883,14 @@ test("force enqueue overrides an interrupted head and allows duplicates", async 
 });
 
 test("persisted queue resumes after restart idle stability without overriding pause", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-queue-restart-")), file = path.join(root, "queue.json"), workspace = path.join(root, "workspace");
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cline-console-queue-restart-")), file = path.join(root, "queue.json"), workspace = path.join(root, "workspace"), storage = path.join(root, "cline-storage");
   await fs.mkdir(workspace);
+  await fs.mkdir(path.join(storage, "state"), { recursive: true });
   await fs.writeFile(file, JSON.stringify({ version: 1, workspace, items: [
     { id: "one", kind: "task", sourcePath: "/tasks/one.md", prompt: "Task one", state: "queued", queuedAt: "before" }
   ] }));
+  const previousStorage = process.env.CLINE_VSCODE_STORAGE_DIR;
+  process.env.CLINE_VSCODE_STORAGE_DIR = storage;
   const dispatched: string[] = [];
   const adapter = {
     newTask: async (prompt: string) => { dispatched.push(prompt); return { taskStarted: true }; },
@@ -845,6 +908,8 @@ test("persisted queue resumes after restart idle stability without overriding pa
     while (!dispatched.length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
     assert.deepEqual(dispatched, ["Task one"]);
   } finally {
+    if (previousStorage === undefined) delete process.env.CLINE_VSCODE_STORAGE_DIR;
+    else process.env.CLINE_VSCODE_STORAGE_DIR = previousStorage;
     await queue.stop();
     await fs.rm(root, { recursive: true });
   }

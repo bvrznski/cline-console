@@ -94,8 +94,13 @@ test("canonical queue grammar preserves batches and explicit selectors", () => {
   assert.deepEqual(normalizeCommand(parseArgs(["queue", "add", "/tasks/9.1"])).parsed.commandArgs, ["/tasks/9.1"]);
   assert.deepEqual(normalizeCommand(parseArgs(["queue", "replace", "--dir", "tasks"])).parsed.commandArgs, ["--dir", "tasks"]);
   assert.deepEqual(normalizeCommand(parseArgs(["queue", "remove", "--id", "abc"])).parsed.commandArgs, ["pop", "abc", "id"]);
-  assert.deepEqual(normalizeCommand(parseArgs(["queue", "clear", "--force"])).parsed.commandArgs, ["clear", "--force"]);
+  assert.deepEqual(normalizeCommand(parseArgs(["queue", "--clear"])).parsed.commandArgs, ["clear"]);
+  assert.deepEqual(normalizeCommand(parseArgs(["queue", "--purge", "--force"])).parsed.commandArgs, ["purge", "--force"]);
+  assert.throws(() => normalizeCommand(parseArgs(["queue", "--clear", "--force"])), /accepts no additional arguments/);
   assert.deepEqual(normalizeCommand(parseArgs(["queue", "trim", "2"])).parsed.commandArgs, ["trim", "2"]);
+  assert.deepEqual(normalizeCommand(parseArgs(["queue", "--next"])).parsed.commandArgs, ["next"]);
+  assert.deepEqual(normalizeCommand(parseArgs(["queue", "next"])).parsed.commandArgs, ["next"]);
+  assert.throws(() => normalizeCommand(parseArgs(["queue", "--next", "extra"])), /accepts no additional arguments/);
   assert.deepEqual(normalizeCommand(parseArgs(["queue", "add", "--from", "TASKS.txt"])).parsed.commandArgs, ["--from", "TASKS.txt"]);
   assert.throws(() => normalizeCommand(parseArgs(["queue", "trim", "0"])), /positive integer/);
 });

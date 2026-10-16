@@ -150,6 +150,10 @@ Remove one waiting entry by queue ID.
 Retain the first NUMBER active positions, counting a running head as position 1,
 and remove the remaining waiting suffix in one operation.
 .TP
+.B queue --next
+Explicitly skip the current cline-console-owned queue task and request dispatch
+of the next queued task. The skipped task is recorded as skipped, not completed.
+.TP
 .B queue pause
 Allow the current task to finish, then prevent the next task from dispatching.
 The pause is persisted.
@@ -159,7 +163,11 @@ Clear the persisted pause and resume FIFO processing. This is also an explicit
 execution override: when another workspace uses the same LM Studio model, its
 queue task is interrupted and this workspace takes over after the handoff delay.
 .TP
-.B queue clear [--force]
+.B queue --clear
+Remove retained completed, failed, and skipped records while preserving all
+running and waiting queue work.
+.TP
+.B queue --purge [--force]
 Remove all waiting and running queue entries without changing Cline history.
 With
 .BR --force ,

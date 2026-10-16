@@ -58,7 +58,9 @@ Usage:
   cline-console [OPTIONS] queue list
   cline-console --workspace PATH queue remove (--file PATH|--title TITLE|--id ID)
   cline-console --workspace PATH queue trim NUMBER
-  cline-console --workspace PATH queue clear [--force]
+  cline-console --workspace PATH queue --next
+  cline-console --workspace PATH queue --clear
+  cline-console --workspace PATH queue --purge [--force]
   cline-console --workspace PATH queue pause|resume
   cline-console workspace list
   cline-console --workspace PATH workspace clear
@@ -233,13 +235,17 @@ export async function run(argv = process.argv.slice(2)): Promise<number> {
   }
   if (parsed.command === "queue") {
     const operation = parsed.commandArgs[0];
-    if (operation === "clear" || operation === "--clear" || operation === "pop" || operation === "--pop" || operation === "trim" || operation === "pause" || operation === "--pause" || operation === "resume" || operation === "--resume") {
+    if (operation === "clear" || operation === "purge" || operation === "pop" || operation === "--pop" || operation === "trim" || operation === "next" || operation === "pause" || operation === "--pause" || operation === "resume" || operation === "--resume") {
       if (!parsed.workspace) throw new Error(`queue ${operation.replace(/^--/, "")} requires --workspace PATH.`);
       const target = await resolveWorkspace(registrations, parsed.workspace, process.cwd());
-      if (operation.endsWith("clear")) {
+      if (operation === "clear") {
+        if (parsed.commandArgs.length !== 1) throw new Error("queue --clear accepts no additional arguments.");
+        const result = await invoke(target, "cleanQueue") as { cleared: number; completed: number; failed: number; skipped: number; queueLength: number };
+        process.stdout.write(parsed.json ? `${JSON.stringify({ workspace: target.workspace, ...result }, null, 2)}\n` : `Workspace: ${target.workspace}\nCleaned terminal records: ${result.cleared} (${result.completed} completed, ${result.failed} failed, ${result.skipped} skipped)\nActive queue preserved: ${result.queueLength}\n`);
+      } else if (operation === "purge") {
         const force = parsed.commandArgs.length === 2 && parsed.commandArgs[1] === "--force";
-        if (parsed.commandArgs.length !== 1 && !force) throw new Error("queue clear accepts only the optional --force flag.");
-        const result = await invoke(target, "clearQueue", force ? { force: true } : undefined) as { cleared: number; clearedWaiting: number; clearedStaleRunning: number; queueLength: number; runningPreserved: boolean; historyDeleted: number };
+        if (parsed.commandArgs.length !== 1 && !force) throw new Error("queue --purge accepts only the optional --force flag.");
+        const result = await invoke(target, "purgeQueue", force ? { force: true } : undefined) as { cleared: number; clearedWaiting: number; clearedStaleRunning: number; queueLength: number; runningPreserved: boolean; historyDeleted: number };
         process.stdout.write(parsed.json ? `${JSON.stringify({ workspace: target.workspace, ...result }, null, 2)}\n` : `Workspace: ${target.workspace}\nCleared waiting items: ${result.clearedWaiting}\nCleared running items: ${result.clearedStaleRunning}\n${force ? `Deleted Cline history tasks: ${result.historyDeleted}` : "Cline history: preserved"}\nQueue length: ${result.queueLength}\n`);
       } else if (operation.endsWith("pop")) {
         if ((parsed.commandArgs.length !== 2 && parsed.commandArgs.length !== 3) || !parsed.commandArgs[1]) throw new Error("queue remove requires one file path, displayed title, or queue ID.");
@@ -251,6 +257,10 @@ export async function run(argv = process.argv.slice(2)): Promise<number> {
         if (parsed.commandArgs.length !== 2 || !/^[1-9]\d*$/.test(parsed.commandArgs[1])) throw new Error("queue trim requires one positive integer.");
         const result = await invoke(target, "trimQueue", { keep: Number(parsed.commandArgs[1]) }) as { trimmed: number; kept: number; queueLength: number };
         process.stdout.write(parsed.json ? `${JSON.stringify({ workspace: target.workspace, ...result }, null, 2)}\n` : `Workspace: ${target.workspace}\nTrimmed waiting items: ${result.trimmed}\nRetained active items: ${result.kept}\nQueue length: ${result.queueLength}\n`);
+      } else if (operation === "next") {
+        if (parsed.commandArgs.length !== 1) throw new Error("queue --next accepts no additional arguments.");
+        const result = await invoke(target, "advanceQueue") as { advanced: boolean; skipped?: { id: string; title: string }; queueLength: number };
+        process.stdout.write(parsed.json ? `${JSON.stringify({ workspace: target.workspace, ...result }, null, 2)}\n` : `Workspace: ${target.workspace}\n${result.skipped ? `Skipped: ${result.skipped.title}\n` : "No running queue task to skip.\n"}Next task: ${result.advanced ? "dispatch requested" : "none queued"}\nQueue length: ${result.queueLength}\n`);
       } else if (operation.endsWith("pause")) {
         if (parsed.commandArgs.length !== 1) throw new Error("queue pause accepts no additional arguments.");
         const result = await invoke(target, "pauseQueue") as { paused: boolean; queueLength: number; runningPreserved: boolean };
@@ -262,7 +272,7 @@ export async function run(argv = process.argv.slice(2)): Promise<number> {
       }
       return 0;
     }
-    if (parsed.commandArgs.length) throw new Error("queue accepts only clear, remove, trim, pause, or resume as an operation.");
+    if (parsed.commandArgs.length) throw new Error("queue accepts only --clear, --purge, remove, trim, --next, pause, or resume as an operation.");
     const persisted = await discoverPersistedQueueStatuses(queueStateDirectory());
     const targets = parsed.workspace ? await selectQueueTargets(registrations, persisted, parsed.workspace) : registrations;
     const queuesByWorkspace = new Map<string, WorkspaceQueueStatus>(persisted.map(status => {
